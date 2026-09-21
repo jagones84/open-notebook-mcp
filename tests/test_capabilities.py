@@ -105,6 +105,38 @@ def test_generate_artifact_accepts_a_variant():
     assert "variant" in capability.args
 
 
+def test_create_source_posts_to_the_json_endpoint(monkeypatch):
+    """POST /api/sources is multipart-only; the JSON contract lives at /sources/json."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    calls: dict = {}
+
+    async def fake_request(method, path, **kwargs):
+        calls["method"] = method
+        calls["path"] = path
+        calls["json"] = kwargs.get("json_data")
+        return {"id": "source:1"}
+
+    monkeypatch.setattr(server, "make_request", fake_request)
+
+    result = asyncio.run(
+        server.create_source(
+            notebook_id="notebook:1",
+            type="link",
+            url="https://example.com",
+            embed=False,
+        )
+    )
+
+    assert calls["method"] == "POST"
+    assert calls["path"] == "/api/sources/json"
+    assert calls["json"]["type"] == "link"
+    assert calls["json"]["embed"] is False
+    assert result["source"]["id"] == "source:1"
+
+
 if __name__ == "__main__":
     # Run tests
     test_capabilities_defined()
