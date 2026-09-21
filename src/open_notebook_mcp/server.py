@@ -23,7 +23,9 @@ mcp = FastMCP("open-notebook-mcp")
 MAX_LIMIT = 100
 
 # Default timeout for HTTP requests (seconds)
-DEFAULT_TIMEOUT_S = 30.0
+# PATCHED-TIMEOUT-V1: 30s aborted slow RAG asks (40-50s); an httpx timeout
+# carries an EMPTY message, so callers only saw "API request failed: ".
+DEFAULT_TIMEOUT_S = float(os.getenv("OPEN_NOTEBOOK_TIMEOUT_S", "300"))
 
 def get_base_url() -> str:
     """Get the Open Notebook API base URL from environment."""
@@ -913,12 +915,40 @@ async def search(
         "results": results,
     }
 
+async def _resolve_models(
+    strategy_model: Optional[str] = None,
+    answer_model: Optional[str] = None,
+    final_answer_model: Optional[str] = None,
+) -> tuple[str, str, str]:
+    """PATCHED-DEFAULT-V1: fall back to the app default chat model.
+
+    Settings -> Modelli is the single source of truth, so the MCP follows
+    it when the caller omits a model id instead of demanding one.
+    """
+    if strategy_model and answer_model and final_answer_model:
+        return strategy_model, answer_model, final_answer_model
+    defaults = await make_request("GET", "/api/models/defaults")
+    fallback = (
+        defaults.get("default_chat_model")
+        if isinstance(defaults, dict) else None
+    )
+    if not fallback:
+        raise Exception(
+            "no model supplied and no default_chat_model configured"
+        )
+    return (
+        strategy_model or fallback,
+        answer_model or fallback,
+        final_answer_model or fallback,
+    )
+
+
 @mcp.tool()
 async def ask_question(
     question: str,
-    strategy_model: str,
-    answer_model: str,
-    final_answer_model: str,
+    strategy_model: Optional[str] = None,
+    answer_model: Optional[str] = None,
+    final_answer_model: Optional[str] = None,
     notebook_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Ask a question about your content with detailed control.
@@ -933,6 +963,10 @@ async def ask_question(
     Returns:
         Answer with sources and reasoning
     """
+    # PATCHED-DEFAULT-V1: models optional -> fall back to the app default.
+    strategy_model, answer_model, final_answer_model = await _resolve_models(
+        strategy_model, answer_model, final_answer_model
+    )
     data = {
         "question": question,
         "strategy_model": strategy_model,
@@ -951,9 +985,9 @@ async def ask_question(
 @mcp.tool()
 async def ask_simple(
     question: str,
-    strategy_model: str,
-    answer_model: str,
-    final_answer_model: str,
+    strategy_model: Optional[str] = None,
+    answer_model: Optional[str] = None,
+    final_answer_model: Optional[str] = None,
     notebook_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Ask a question about your content with simplified interface.
@@ -968,6 +1002,10 @@ async def ask_simple(
     Returns:
         Simple answer
     """
+    # PATCHED-DEFAULT-V1: models optional -> fall back to the app default.
+    strategy_model, answer_model, final_answer_model = await _resolve_models(
+        strategy_model, answer_model, final_answer_model
+    )
     data = {
         "question": question,
         "strategy_model": strategy_model,
@@ -1210,8 +1248,10 @@ async def execute_chat(
         "session_id": session_id,
         "message": message,
     }
-    if context is not None:
-        data["context"] = context
+    # PATCHED-CONTRACT-V1: the API requires "context" (Field(...) with no
+    # default, api/routers/chat.py:69); omitting it returns 422. Empty dict
+    # means "no sources/notes", which the chat graph accepts.
+    data["context"] = context if context is not None else {}
     
     response = await make_request("POST", "/api/chat/execute", json_data=data)
     return {
@@ -1236,8 +1276,9 @@ async def get_chat_context(
     data = {
         "notebook_id": notebook_id,
     }
-    if context_config is not None:
-        data["context_config"] = context_config
+    # PATCHED-CONTRACT-V1: the API requires "context_config"
+    # (api/routers/chat.py:84); omitting it returns 422.
+    data["context_config"] = context_config if context_config is not None else {}
     
     context = await make_request("POST", "/api/chat/context", json_data=data)
     return {
@@ -1298,14 +1339,30 @@ def main() -> None:
     stateless_http = os.getenv("STATELESS_HTTP", "1") == "1"
     json_response = os.getenv("JSON_RESPONSE", "1") == "1"
 
-    mcp.run(
-        transport="streamable-http",
-        host=host,
-        port=port,
-        path=path,
-        stateless_http=stateless_http,
-        json_response=json_response,
-    )
+    # PATCHED-FOR-MCP1: mcp 1.x takes host/port/etc. via settings, not run()
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.streamable_http_path = path
+    mcp.settings.json_response = json_response
+    mcp.settings.stateless_http = stateless_http
+
+    # PATCHED-FOR-MCP1: FastMCP() was built with the default loopback host, so
+    # DNS-rebinding protection was auto-enabled with loopback-only allowed
+    # hosts; widen it from env for non-loopback clients (else HTTP 421).
+    extra_hosts = [
+        h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+    ]
+    if extra_hosts:
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"] + extra_hosts,
+            allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+            + [f"http://{h}" for h in extra_hosts],
+        )
+
+    mcp.run(transport="streamable-http")
 
 if __name__ == "__main__":
     main()
