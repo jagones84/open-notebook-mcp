@@ -388,8 +388,8 @@ CAPABILITIES: tuple[Capability, ...] = (
     # Artifacts API (upstream #203) - requires an instance that serves it
     Capability(
         name="generate_artifact",
-        summary="Generate a report or slide artifact from a notebook.",
-        tags=("artifacts", "report", "slides", "generate", "native"),
+        summary="Generate a report or deck from a notebook (a deck adds diagrams).",
+        tags=("artifacts", "report", "deck", "diagrams", "mermaid", "generate", "native"),
         args={
             "notebook_id": "str",
             "kind": "str",
@@ -403,8 +403,8 @@ CAPABILITIES: tuple[Capability, ...] = (
         returns="dict[str, Any]",
         example={
             "notebook_id": "notebook:abc123",
-            "kind": "report",
-            "formats": ["md", "docx"],
+            "kind": "deck",
+            "formats": ["md", "docx", "pptx"],
             "language": "Italian",
         },
         typical_bytes=600,
@@ -1460,10 +1460,16 @@ async def generate_artifact(
 
     Args:
         notebook_id: Notebook whose sources feed the artifact.
-        kind: What to generate, e.g. 'report' or 'slides'.
-        formats: Rendered formats ('md', 'html', 'docx', 'pptx').
+        kind: Either 'report' or 'deck' (no other value is accepted). The two
+            are NOT just a title difference: a 'deck' also asks the writer for
+            ```mermaid``` diagrams and renders them to images, a 'report'
+            never contains diagrams. There is no separate diagrams flag - the
+            kind IS the switch.
+        formats: Rendered formats ('md', 'html', 'docx', 'pptx'). For a deck,
+            include 'pptx' if you want the slide file.
         language: Language name for the output.
-        title: Optional title override.
+        title: Optional title override. Putting "with diagrams" in the title
+            does NOT enable diagrams - only kind='deck' does.
         instructions: Optional extra guidance for the writer.
         sections: How many sections to outline and write.
         model_id: Optional model id override for the generation.
