@@ -362,6 +362,80 @@ CAPABILITIES: tuple[Capability, ...] = (
         example={"settings": {"theme": "dark"}},
         typical_bytes=1000,
     ),
+    # Web discovery API (upstream #973) - requires an instance that serves it
+    Capability(
+        name="discover_sources",
+        summary="Search the web and attach the hits to a notebook as sources.",
+        tags=("discover", "web", "search", "sources", "create", "native"),
+        args={
+            "query": "str",
+            "notebook_id": "str",
+            "limit": "int",
+            "provider": "Optional[str]",
+            "embed": "bool",
+            "exclude_domains": "Optional[list[str]]",
+            "dry_run": "bool",
+        },
+        returns="dict[str, Any]",
+        example={
+            "query": "DGX Spark local LLM inference performance",
+            "notebook_id": "notebook:abc123",
+            "limit": 5,
+            "dry_run": True,
+        },
+        typical_bytes=4000,
+    ),
+    # Artifacts API (upstream #203) - requires an instance that serves it
+    Capability(
+        name="generate_artifact",
+        summary="Generate a report or slide artifact from a notebook.",
+        tags=("artifacts", "report", "slides", "generate", "native"),
+        args={
+            "notebook_id": "str",
+            "kind": "str",
+            "formats": "Optional[list[str]]",
+            "language": "str",
+            "title": "Optional[str]",
+            "instructions": "Optional[str]",
+            "sections": "int",
+            "model_id": "Optional[str]",
+        },
+        returns="dict[str, Any]",
+        example={
+            "notebook_id": "notebook:abc123",
+            "kind": "report",
+            "formats": ["md", "docx"],
+            "language": "Italian",
+        },
+        typical_bytes=600,
+    ),
+    Capability(
+        name="list_artifacts",
+        summary="List generated artifacts, newest first.",
+        tags=("artifacts", "list", "query", "native"),
+        args={"notebook_id": "Optional[str]"},
+        returns="dict[str, Any]",
+        example={"notebook_id": "notebook:abc123"},
+        typical_bytes=3000,
+    ),
+    Capability(
+        name="get_artifact",
+        summary="Get one artifact with the status of its generation job.",
+        tags=("artifacts", "get", "read", "poll", "native"),
+        args={"artifact_id": "str"},
+        returns="dict[str, Any]",
+        example={"artifact_id": "artifact:abc123"},
+        typical_bytes=1500,
+    ),
+    Capability(
+        name="delete_artifact",
+        summary="Delete an artifact and its rendered files.",
+        tags=("artifacts", "delete", "write", "native"),
+        args={"artifact_id": "str"},
+        returns="dict[str, Any]",
+        example={"artifact_id": "artifact:abc123"},
+        typical_bytes=100,
+    ),
 )
 
 def _normalize(s: str) -> str:
@@ -1317,6 +1391,158 @@ async def update_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return {
         "request_id": generate_request_id(),
         "settings": result,
+    }
+
+# -----------------------------
+# Native web discovery (#973) and artifacts (#203)
+# -----------------------------
+# These two capabilities are not CRUD on an existing resource: discovery is a
+# search that creates sources, and an artifact is an async generation job.
+# They only exist on an instance built from the branch that adds them; against
+# an instance that does not serve them these tools return 404.
+
+@mcp.tool()
+async def discover_sources(
+    query: str,
+    notebook_id: str,
+    limit: int = 5,
+    provider: Optional[str] = None,
+    embed: bool = False,
+    exclude_domains: Optional[list[str]] = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Search the web and attach the hits to a notebook as sources.
+
+    Args:
+        query: What to search for (the topic to find sources about).
+        notebook_id: Notebook to attach the discovered sources to. Create one
+            first with create_notebook if the notebook does not exist yet.
+        limit: Maximum number of sources to create (1-20).
+        provider: Search backend name; omit to use the instance default.
+        embed: Embed the created sources so they are usable for vector search.
+        exclude_domains: Domains the provider must not return.
+        dry_run: Preview the ranked candidates without creating anything.
+
+    Returns:
+        The provider used, how many sources were created, how many were skipped
+        because the notebook already had them, and every hit with its outcome.
+    """
+    limit = max(1, min(limit, 20))
+    data: dict[str, Any] = {
+        "query": query,
+        "notebook_id": notebook_id,
+        "limit": limit,
+        "embed": embed,
+        "dry_run": dry_run,
+        "exclude_domains": exclude_domains or [],
+    }
+    if provider is not None:
+        data["provider"] = provider
+
+    result = await make_request("POST", "/api/sources/discover", json_data=data)
+    return {
+        "request_id": generate_request_id(),
+        "result": result,
+    }
+
+@mcp.tool()
+async def generate_artifact(
+    notebook_id: str,
+    kind: str = "report",
+    formats: Optional[list[str]] = None,
+    language: str = "en",
+    title: Optional[str] = None,
+    instructions: Optional[str] = None,
+    sections: int = 10,
+    model_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Generate a report or slide artifact from a notebook.
+
+    Args:
+        notebook_id: Notebook whose sources feed the artifact.
+        kind: What to generate, e.g. 'report' or 'slides'.
+        formats: Rendered formats ('md', 'html', 'docx', 'pptx').
+        language: Language name for the output.
+        title: Optional title override.
+        instructions: Optional extra guidance for the writer.
+        sections: How many sections to outline and write.
+        model_id: Optional model id override for the generation.
+
+    Returns:
+        A command_id and an artifact_id. Generation runs in the background, so
+        poll get_artifact with the artifact_id until job_status settles.
+    """
+    data: dict[str, Any] = {
+        "notebook_id": notebook_id,
+        "kind": kind,
+        "formats": formats or ["md", "docx"],
+        "language": language,
+        "sections": sections,
+    }
+    if title is not None:
+        data["title"] = title
+    if instructions is not None:
+        data["instructions"] = instructions
+    if model_id is not None:
+        data["model_id"] = model_id
+
+    result = await make_request("POST", "/api/artifacts", json_data=data)
+    return {
+        "request_id": generate_request_id(),
+        "result": result,
+    }
+
+@mcp.tool()
+async def list_artifacts(notebook_id: Optional[str] = None) -> dict[str, Any]:
+    """List generated artifacts, newest first.
+
+    Args:
+        notebook_id: Optional notebook ID to filter by.
+
+    Returns:
+        Dictionary with the artifacts and their job status.
+    """
+    params: dict[str, Any] = {}
+    if notebook_id is not None:
+        params["notebook_id"] = notebook_id
+
+    artifacts = await make_request("GET", "/api/artifacts", params=params)
+    return {
+        "request_id": generate_request_id(),
+        "count": len(artifacts) if isinstance(artifacts, list) else 0,
+        "artifacts": artifacts,
+    }
+
+@mcp.tool()
+async def get_artifact(artifact_id: str) -> dict[str, Any]:
+    """Get one artifact, including the status of its generation job.
+
+    Args:
+        artifact_id: Artifact ID (e.g. 'artifact:abc123').
+
+    Returns:
+        Artifact details with job_status, error_message and download_url.
+    """
+    artifact = await make_request("GET", f"/api/artifacts/{artifact_id}")
+    return {
+        "request_id": generate_request_id(),
+        "artifact": artifact,
+    }
+
+@mcp.tool()
+async def delete_artifact(artifact_id: str) -> dict[str, Any]:
+    """Delete an artifact and its rendered files.
+
+    Args:
+        artifact_id: Artifact ID.
+
+    Returns:
+        Success message.
+    """
+    result = await make_request("DELETE", f"/api/artifacts/{artifact_id}")
+    return {
+        "request_id": generate_request_id(),
+        "result": result,
     }
 
 # -----------------------------
