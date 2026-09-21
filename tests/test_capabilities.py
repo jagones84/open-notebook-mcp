@@ -91,6 +91,20 @@ def test_generate_artifact_asks_for_a_handful_of_sections():
     assert default == 5
 
 
+def test_generate_artifact_accepts_a_variant():
+    """The kind sub-variant is part of the contract and must reach the API."""
+    import inspect
+
+    from open_notebook_mcp.server import generate_artifact
+
+    parameters = inspect.signature(generate_artifact).parameters
+    assert "variant" in parameters
+    assert parameters["variant"].default is None
+
+    capability = next(cap for cap in CAPABILITIES if cap.name == "generate_artifact")
+    assert "variant" in capability.args
+
+
 if __name__ == "__main__":
     # Run tests
     test_capabilities_defined()

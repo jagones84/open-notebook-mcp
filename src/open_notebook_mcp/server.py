@@ -393,6 +393,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         args={
             "notebook_id": "str",
             "kind": "str",
+            "variant": "Optional[str]",
             "formats": "Optional[list[str]]",
             "language": "str",
             "title": "Optional[str]",
@@ -1449,6 +1450,7 @@ async def discover_sources(
 async def generate_artifact(
     notebook_id: str,
     kind: str = "report",
+    variant: Optional[str] = None,
     formats: Optional[list[str]] = None,
     language: str = "en",
     title: Optional[str] = None,
@@ -1462,18 +1464,23 @@ async def generate_artifact(
         notebook_id: Notebook whose sources feed the artifact.
         kind: 'report' or 'deck'. 'slides' is accepted as an alias for deck,
             and any other value silently falls back to 'report' (it is
-            normalised server-side, not rejected). This is NOT only a title
-            difference: a 'deck' is written as short bullets (max 18 words each)
-            and also asks the writer for ```mermaid``` diagrams rendered to
-            images, while a 'report' is written as prose and never contains
-            diagrams. There is no separate diagrams flag - the kind IS the
-            switch. Which FILES come out is a separate question, see formats.
+            normalised server-side, not rejected). A deck is written as
+            bullets, a report as prose. Which FILES come out is a separate
+            question, see formats.
+        variant: Sub-variant of the kind. A report has 'document' (plain
+            prose, no diagrams) and 'illustrated' (prose plus ```mermaid```
+            diagrams rendered to images); a deck has 'presenter' (concise
+            bullets) and 'detailed' (full sentences under each bullet).
+            Defaults: 'document' for a report, 'presenter' for a deck. A
+            variant of the other kind is rejected with HTTP 400. Diagrams are
+            off for a plain report and on for everything else, so an
+            'illustrated' report is the way to get prose AND diagrams.
         formats: Rendered formats ('md', 'html', 'docx', 'pptx'). This is
             independent of kind: a deck is NOT automatically a pptx. Pass
             'pptx' explicitly if you want the slide file.
         language: Language name for the output.
         title: Optional title override. Putting "with diagrams" in the title
-            does NOT enable diagrams - only kind='deck' does.
+            does NOT enable diagrams - use variant='illustrated' or a deck.
         instructions: Optional extra guidance for the writer.
         sections: How many sections to outline and write.
         model_id: Optional model id override for the generation.
@@ -1489,6 +1496,8 @@ async def generate_artifact(
         "language": language,
         "sections": sections,
     }
+    if variant is not None:
+        data["variant"] = variant
     if title is not None:
         data["title"] = title
     if instructions is not None:
