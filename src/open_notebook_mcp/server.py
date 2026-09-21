@@ -1460,13 +1460,17 @@ async def generate_artifact(
 
     Args:
         notebook_id: Notebook whose sources feed the artifact.
-        kind: Either 'report' or 'deck' (no other value is accepted). The two
-            are NOT just a title difference: a 'deck' also asks the writer for
-            ```mermaid``` diagrams and renders them to images, a 'report'
-            never contains diagrams. There is no separate diagrams flag - the
-            kind IS the switch.
-        formats: Rendered formats ('md', 'html', 'docx', 'pptx'). For a deck,
-            include 'pptx' if you want the slide file.
+        kind: 'report' or 'deck'. 'slides' is accepted as an alias for deck,
+            and any other value silently falls back to 'report' (it is
+            normalised server-side, not rejected). This is NOT only a title
+            difference: a 'deck' is written as short bullets (max 18 words each)
+            and also asks the writer for ```mermaid``` diagrams rendered to
+            images, while a 'report' is written as prose and never contains
+            diagrams. There is no separate diagrams flag - the kind IS the
+            switch. Which FILES come out is a separate question, see formats.
+        formats: Rendered formats ('md', 'html', 'docx', 'pptx'). This is
+            independent of kind: a deck is NOT automatically a pptx. Pass
+            'pptx' explicitly if you want the slide file.
         language: Language name for the output.
         title: Optional title override. Putting "with diagrams" in the title
             does NOT enable diagrams - only kind='deck' does.
