@@ -81,6 +81,16 @@ def test_search_capabilities_limit():
     assert result["count"] <= 50
 
 
+def test_generate_artifact_asks_for_a_handful_of_sections():
+    """A document is a book: few broad chapters, so the default must match the API."""
+    import inspect
+
+    from open_notebook_mcp.server import generate_artifact
+
+    default = inspect.signature(generate_artifact).parameters["sections"].default
+    assert default == 5
+
+
 if __name__ == "__main__":
     # Run tests
     test_capabilities_defined()
