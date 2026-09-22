@@ -137,6 +137,43 @@ def test_create_source_posts_to_the_json_endpoint(monkeypatch):
     assert result["source"]["id"] == "source:1"
 
 
+def test_timeout_reader_accepts_a_positive_finite_value():
+    """A sane OPEN_NOTEBOOK_TIMEOUT_S is read as a float."""
+    from open_notebook_mcp.server import _read_timeout_s
+
+    assert _read_timeout_s("45") == 45.0
+    assert _read_timeout_s("0.5") == 0.5
+
+
+def test_timeout_reader_rejects_values_httpx_would_accept():
+    """Zero, negative, infinite and NaN timeouts must not reach httpx."""
+    import pytest
+
+    from open_notebook_mcp.server import _read_timeout_s
+
+    for raw in ("0", "-1", "nan", "inf", "-inf", "abc", ""):
+        with pytest.raises(ValueError):
+            _read_timeout_s(raw)
+
+
+def test_default_timeout_is_positive_and_finite():
+    """The timeout the client actually uses must be usable."""
+    import math
+
+    from open_notebook_mcp.server import DEFAULT_TIMEOUT_S
+
+    assert math.isfinite(DEFAULT_TIMEOUT_S)
+    assert DEFAULT_TIMEOUT_S > 0
+
+
+def test_ask_tools_publish_optional_models():
+    """The capability metadata has to match the Optional[str] signatures."""
+    for name in ("ask_question", "ask_simple"):
+        capability = next(cap for cap in CAPABILITIES if cap.name == name)
+        for key in ("strategy_model", "answer_model", "final_answer_model"):
+            assert capability.args[key] == "Optional[str]", f"{name}.{key}"
+
+
 if __name__ == "__main__":
     # Run tests
     test_capabilities_defined()

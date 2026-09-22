@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import uuid
@@ -22,10 +23,39 @@ mcp = FastMCP("open-notebook-mcp")
 # Maximum number of items to return in list operations
 MAX_LIMIT = 100
 
+def _read_timeout_s(raw: str) -> float:
+    """Return the HTTP timeout in seconds, refusing values httpx accepts silently.
+
+    httpx takes zero, negative, infinite and NaN timeouts at face value, so a
+    typo in the environment turned into requests that either hang forever or
+    fail on the first byte. Invalid input raises instead of degrading quietly.
+
+    Args:
+        raw: Raw value of OPEN_NOTEBOOK_TIMEOUT_S, or the default when unset.
+
+    Returns:
+        The timeout in seconds, always positive and finite.
+
+    Raises:
+        ValueError: If raw is not a positive, finite number.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"OPEN_NOTEBOOK_TIMEOUT_S must be a number, got {raw!r}"
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"OPEN_NOTEBOOK_TIMEOUT_S must be a positive finite number, got {raw!r}"
+        )
+    return value
+
+
 # Default timeout for HTTP requests (seconds)
 # PATCHED-TIMEOUT-V1: 30s aborted slow RAG asks (40-50s); an httpx timeout
 # carries an EMPTY message, so callers only saw "API request failed: ".
-DEFAULT_TIMEOUT_S = float(os.getenv("OPEN_NOTEBOOK_TIMEOUT_S", "300"))
+DEFAULT_TIMEOUT_S = _read_timeout_s(os.getenv("OPEN_NOTEBOOK_TIMEOUT_S", "300"))
 
 def get_base_url() -> str:
     """Get the Open Notebook API base URL from environment."""
@@ -219,7 +249,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         name="ask_question",
         summary="Ask a question about your content with detailed control.",
         tags=("search", "ask", "ai", "question"),
-        args={"question": "str", "strategy_model": "str", "answer_model": "str", "final_answer_model": "str"},
+        args={"question": "str", "strategy_model": "Optional[str]", "answer_model": "Optional[str]", "final_answer_model": "Optional[str]"},
         returns="dict[str, Any]",
         example={"question": "What are the main AI applications?", "strategy_model": "model:abc", "answer_model": "model:abc", "final_answer_model": "model:abc"},
         typical_bytes=5000,
@@ -228,7 +258,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         name="ask_simple",
         summary="Ask a question about your content with simplified interface.",
         tags=("search", "ask", "ai", "question", "simple"),
-        args={"question": "str", "strategy_model": "str", "answer_model": "str", "final_answer_model": "str"},
+        args={"question": "str", "strategy_model": "Optional[str]", "answer_model": "Optional[str]", "final_answer_model": "Optional[str]"},
         returns="dict[str, Any]",
         example={"question": "Summarize my AI research", "strategy_model": "model:abc", "answer_model": "model:abc", "final_answer_model": "model:abc"},
         typical_bytes=4000,
