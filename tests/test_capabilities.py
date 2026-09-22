@@ -1,6 +1,20 @@
 """Tests for the Open Notebook MCP server."""
 
+import json
+
+import respx
+from httpx import Response
+
 from open_notebook_mcp.server import CAPABILITIES, search_capabilities
+
+#: The host the tools are pointed at during tests, so respx can intercept.
+API_BASE = "http://api.test"
+
+
+def _mock_api(monkeypatch):
+    """Point the server at a test host so respx sees the real HTTP path."""
+    monkeypatch.setenv("OPEN_NOTEBOOK_URL", API_BASE)
+    return respx.mock(assert_all_called=True)
 
 
 def test_capabilities_defined():
@@ -111,29 +125,23 @@ def test_create_source_posts_to_the_json_endpoint(monkeypatch):
 
     import open_notebook_mcp.server as server
 
-    calls: dict = {}
-
-    async def fake_request(method, path, **kwargs):
-        calls["method"] = method
-        calls["path"] = path
-        calls["json"] = kwargs.get("json_data")
-        return {"id": "source:1"}
-
-    monkeypatch.setattr(server, "make_request", fake_request)
-
-    result = asyncio.run(
-        server.create_source(
-            notebook_id="notebook:1",
-            type="link",
-            url="https://example.com",
-            embed=False,
+    with _mock_api(monkeypatch) as mock:
+        route = mock.post(f"{API_BASE}/api/sources/json").mock(
+            return_value=Response(200, json={"id": "source:1"})
         )
-    )
+        result = asyncio.run(
+            server.create_source(
+                notebook_id="notebook:1",
+                type="link",
+                url="https://example.com",
+                embed=False,
+            )
+        )
 
-    assert calls["method"] == "POST"
-    assert calls["path"] == "/api/sources/json"
-    assert calls["json"]["type"] == "link"
-    assert calls["json"]["embed"] is False
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["notebook_id"] == "notebook:1"
+    assert sent["type"] == "link"
+    assert sent["embed"] is False
     assert result["source"]["id"] == "source:1"
 
 
@@ -182,12 +190,12 @@ def test_list_artifacts_defaults_to_a_small_page(monkeypatch):
 
     rows = [{"id": f"artifact:{i}", "title": f"A{i}"} for i in range(60)]
 
-    async def fake_request(method, path, **kwargs):
-        return rows
+    with _mock_api(monkeypatch) as mock:
+        mock.get(f"{API_BASE}/api/artifacts").mock(
+            return_value=Response(200, json=rows)
+        )
+        page = asyncio.run(server.list_artifacts())
 
-    monkeypatch.setattr(server, "make_request", fake_request)
-
-    page = asyncio.run(server.list_artifacts())
     assert [a["id"] for a in page["artifacts"]] == [f"artifact:{i}" for i in range(25)]
     assert page["total"] == 60
     assert page["offset"] == 0
@@ -202,12 +210,12 @@ def test_list_artifacts_caps_the_limit(monkeypatch):
 
     rows = [{"id": f"artifact:{i}"} for i in range(300)]
 
-    async def fake_request(method, path, **kwargs):
-        return rows
+    with _mock_api(monkeypatch) as mock:
+        mock.get(f"{API_BASE}/api/artifacts").mock(
+            return_value=Response(200, json=rows)
+        )
+        page = asyncio.run(server.list_artifacts(limit=1000))
 
-    monkeypatch.setattr(server, "make_request", fake_request)
-
-    page = asyncio.run(server.list_artifacts(limit=1000))
     assert len(page["artifacts"]) == 100
     assert page["limit"] == 100
 
@@ -220,12 +228,12 @@ def test_list_artifacts_closes_the_cursor(monkeypatch):
 
     rows = [{"id": f"artifact:{i}"} for i in range(60)]
 
-    async def fake_request(method, path, **kwargs):
-        return rows
+    with _mock_api(monkeypatch) as mock:
+        mock.get(f"{API_BASE}/api/artifacts").mock(
+            return_value=Response(200, json=rows)
+        )
+        page = asyncio.run(server.list_artifacts(limit=25, offset=50))
 
-    monkeypatch.setattr(server, "make_request", fake_request)
-
-    page = asyncio.run(server.list_artifacts(limit=25, offset=50))
     assert [a["id"] for a in page["artifacts"]] == [f"artifact:{i}" for i in range(50, 60)]
     assert page["next_offset"] is None
 
@@ -247,22 +255,19 @@ def test_list_artifacts_shrinks_rows_on_request(monkeypatch):
         "files": ["report.md"],
     }
 
-    async def fake_request(method, path, **kwargs):
-        return [row]
+    with _mock_api(monkeypatch) as mock:
+        mock.get(f"{API_BASE}/api/artifacts").mock(
+            return_value=Response(200, json=[row])
+        )
+        full = asyncio.run(server.list_artifacts(detail="full"))["artifacts"][0]
+        name = asyncio.run(server.list_artifacts(detail="name"))["artifacts"][0]
+        summary = asyncio.run(server.list_artifacts(detail="summary"))["artifacts"][0]
+        picked = asyncio.run(server.list_artifacts(fields=["kind", "id"]))["artifacts"][0]
 
-    monkeypatch.setattr(server, "make_request", fake_request)
-
-    assert asyncio.run(server.list_artifacts(detail="full"))["artifacts"][0] == row
-    assert asyncio.run(server.list_artifacts(detail="name"))["artifacts"][0] == {
-        "id": "artifact:1",
-        "title": "Report",
-    }
-    summary = asyncio.run(server.list_artifacts(detail="summary"))["artifacts"][0]
+    assert full == row
+    assert name == {"id": "artifact:1", "title": "Report"}
     assert "id" in summary and "job_status" in summary and "files" not in summary
-    assert asyncio.run(server.list_artifacts(fields=["kind", "id"]))["artifacts"][0] == {
-        "kind": "report",
-        "id": "artifact:1",
-    }
+    assert picked == {"kind": "report", "id": "artifact:1"}
 
 
 def test_list_artifacts_publishes_its_paging_knobs():
