@@ -174,6 +174,104 @@ def test_ask_tools_publish_optional_models():
             assert capability.args[key] == "Optional[str]", f"{name}.{key}"
 
 
+def test_list_artifacts_defaults_to_a_small_page(monkeypatch):
+    """A list tool must not dump everything: 25 by default, with a cursor."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    rows = [{"id": f"artifact:{i}", "title": f"A{i}"} for i in range(60)]
+
+    async def fake_request(method, path, **kwargs):
+        return rows
+
+    monkeypatch.setattr(server, "make_request", fake_request)
+
+    page = asyncio.run(server.list_artifacts())
+    assert [a["id"] for a in page["artifacts"]] == [f"artifact:{i}" for i in range(25)]
+    assert page["total"] == 60
+    assert page["offset"] == 0
+    assert page["next_offset"] == 25
+
+
+def test_list_artifacts_caps_the_limit(monkeypatch):
+    """The cap has to stay under the 200 ceiling of AGENTS.md 4.1."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    rows = [{"id": f"artifact:{i}"} for i in range(300)]
+
+    async def fake_request(method, path, **kwargs):
+        return rows
+
+    monkeypatch.setattr(server, "make_request", fake_request)
+
+    page = asyncio.run(server.list_artifacts(limit=1000))
+    assert len(page["artifacts"]) == 100
+    assert page["limit"] == 100
+
+
+def test_list_artifacts_closes_the_cursor(monkeypatch):
+    """Paging has to end: no next_offset once the list is exhausted."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    rows = [{"id": f"artifact:{i}"} for i in range(60)]
+
+    async def fake_request(method, path, **kwargs):
+        return rows
+
+    monkeypatch.setattr(server, "make_request", fake_request)
+
+    page = asyncio.run(server.list_artifacts(limit=25, offset=50))
+    assert [a["id"] for a in page["artifacts"]] == [f"artifact:{i}" for i in range(50, 60)]
+    assert page["next_offset"] is None
+
+
+def test_list_artifacts_shrinks_rows_on_request(monkeypatch):
+    """detail and fields exist to keep the model's context small."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    row = {
+        "id": "artifact:1",
+        "notebook_id": "notebook:1",
+        "title": "Report",
+        "kind": "report",
+        "variant": "document",
+        "job_status": "done",
+        "created": "2026-01-01",
+        "files": ["report.md"],
+    }
+
+    async def fake_request(method, path, **kwargs):
+        return [row]
+
+    monkeypatch.setattr(server, "make_request", fake_request)
+
+    assert asyncio.run(server.list_artifacts(detail="full"))["artifacts"][0] == row
+    assert asyncio.run(server.list_artifacts(detail="name"))["artifacts"][0] == {
+        "id": "artifact:1",
+        "title": "Report",
+    }
+    summary = asyncio.run(server.list_artifacts(detail="summary"))["artifacts"][0]
+    assert "id" in summary and "job_status" in summary and "files" not in summary
+    assert asyncio.run(server.list_artifacts(fields=["kind", "id"]))["artifacts"][0] == {
+        "kind": "report",
+        "id": "artifact:1",
+    }
+
+
+def test_list_artifacts_publishes_its_paging_knobs():
+    """The capability index has to describe the knobs the tool really has."""
+    capability = next(cap for cap in CAPABILITIES if cap.name == "list_artifacts")
+    for key in ("notebook_id", "limit", "offset", "fields", "detail"):
+        assert key in capability.args, key
+
+
 if __name__ == "__main__":
     # Run tests
     test_capabilities_defined()

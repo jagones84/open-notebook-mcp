@@ -444,9 +444,15 @@ CAPABILITIES: tuple[Capability, ...] = (
         name="list_artifacts",
         summary="List generated artifacts, newest first.",
         tags=("artifacts", "list", "query", "native"),
-        args={"notebook_id": "Optional[str]"},
+        args={
+            "notebook_id": "Optional[str]",
+            "limit": "int",
+            "offset": "int",
+            "fields": "Optional[list[str]]",
+            "detail": "Literal['name','summary','full']",
+        },
         returns="dict[str, Any]",
-        example={"notebook_id": "notebook:abc123"},
+        example={"notebook_id": "notebook:abc123", "limit": 25, "detail": "summary"},
         typical_bytes=3000,
     ),
     Capability(
@@ -1541,25 +1547,90 @@ async def generate_artifact(
         "result": result,
     }
 
+#: Preset key sets for the detail levels of the artifact list, so a listing can
+#: stay cheap in the model's context. 'full' is absent: it keeps the whole row.
+ARTIFACT_DETAIL_FIELDS: dict[str, tuple[str, ...]] = {
+    "name": ("id", "title"),
+    "summary": (
+        "id",
+        "notebook_id",
+        "title",
+        "kind",
+        "variant",
+        "job_status",
+        "created",
+    ),
+}
+
+def _select_artifact_fields(
+    artifact: Any, fields: Optional[list[str]], detail: str
+) -> Any:
+    """Keep only the asked-for keys of one artifact row.
+
+    Args:
+        artifact: One row as returned by the API.
+        fields: Explicit keys to keep; wins over detail when given.
+        detail: Preset name ('name', 'summary') or 'full' to keep everything.
+
+    Returns:
+        The projected row, or the row untouched when nothing was asked for.
+    """
+    if not isinstance(artifact, dict):
+        return artifact
+    keys = fields if fields else ARTIFACT_DETAIL_FIELDS.get(detail)
+    if not keys:
+        return artifact
+    return {key: artifact[key] for key in keys if key in artifact}
+
 @mcp.tool()
-async def list_artifacts(notebook_id: Optional[str] = None) -> dict[str, Any]:
+async def list_artifacts(
+    notebook_id: Optional[str] = None,
+    limit: int = 25,
+    offset: int = 0,
+    fields: Optional[list[str]] = None,
+    detail: Detail = "summary",
+) -> dict[str, Any]:
     """List generated artifacts, newest first.
+
+    The upstream endpoint returns the whole list, so the page is cut here: a
+    tool that can return a list has to stay small by default (AGENTS.md 4.1).
 
     Args:
         notebook_id: Optional notebook ID to filter by.
+        limit: How many artifacts to return (1-100, default 25).
+        offset: How many artifacts to skip, for paging.
+        fields: Optional list of row keys to keep, for example ['id', 'title'].
+            Wins over detail when both are given.
+        detail: Preset for how big a row is: 'name' (id and title), 'summary'
+            (adds notebook, kind, variant, job status and date) or 'full' (the
+            whole row).
 
     Returns:
-        Dictionary with the artifacts and their job status.
+        The page of artifacts plus total, offset, limit and the next_offset to
+        pass for the following page (None once the list is exhausted).
     """
+    limit = max(1, min(limit, MAX_LIMIT))
+    offset = max(0, offset)
     params: dict[str, Any] = {}
     if notebook_id is not None:
         params["notebook_id"] = notebook_id
 
     artifacts = await make_request("GET", "/api/artifacts", params=params)
+    rows = artifacts if isinstance(artifacts, list) else []
+    total = len(rows)
+    page = [
+        _select_artifact_fields(row, fields, detail)
+        for row in rows[offset : offset + limit]
+    ]
+    consumed = min(offset + len(page), total)
     return {
         "request_id": generate_request_id(),
-        "count": len(artifacts) if isinstance(artifacts, list) else 0,
-        "artifacts": artifacts,
+        "count": len(page),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "next_offset": consumed if consumed < total else None,
+        "artifacts": page,
     }
 
 @mcp.tool()
