@@ -2304,7 +2304,8 @@ async def generate_artifact(
             diagrams rendered to images); a deck has 'presenter' (concise
             bullets) and 'detailed' (full sentences under each bullet).
             Defaults: 'document' for a report, 'presenter' for a deck. A
-            variant of the other kind is rejected with HTTP 400. Diagrams are
+            variant of the other kind is rejected locally with an
+            invalid_input error, before any request is sent. Diagrams are
             off for a plain report and on for everything else, so an
             'illustrated' report is the way to get prose AND diagrams.
         formats: Rendered formats ('md', 'html', 'docx', 'pptx'). This is
