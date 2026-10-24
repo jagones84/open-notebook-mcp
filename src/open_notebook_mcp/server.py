@@ -1380,6 +1380,18 @@ async def _stream_ask(data: dict[str, Any]) -> dict[str, Any]:
             f"Ask request exceeded the {DEFAULT_TIMEOUT_S:g}s overall deadline",
             "Raise OPEN_NOTEBOOK_TIMEOUT_S, or ask a shorter question.",
         ) from exc
+    except httpx.TimeoutException as exc:
+        raise ToolTimeoutError(
+            "timeout",
+            f"Ask request timed out after {DEFAULT_TIMEOUT_S:g}s",
+            "Raise OPEN_NOTEBOOK_TIMEOUT_S, or ask a shorter question.",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise ToolApiError(
+            "network_error",
+            f"Could not reach the Open Notebook ask endpoint: {exc}",
+            "Check that OPEN_NOTEBOOK_URL points to a reachable API instance.",
+        ) from exc
 
     if not completed:
         raise ToolApiError(

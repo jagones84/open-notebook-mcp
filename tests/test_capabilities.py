@@ -526,6 +526,62 @@ def test_list_artifacts_shrinks_rows_on_request(monkeypatch):
     assert picked == {"kind": "report", "id": "artifact:1"}
 
 
+def test_ask_tools_translate_a_network_failure_into_a_structured_error(monkeypatch):
+    """A raw HTTPX error must not escape the ask tools."""
+    import asyncio
+
+    import httpx
+    import pytest
+
+    from open_notebook_mcp import server
+
+    with _mock_api(monkeypatch) as mock:
+        mock.post(f"{API_BASE}/api/search/ask").mock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        with pytest.raises(server.ToolApiError) as excinfo:
+            asyncio.run(
+                server.ask_simple(
+                    question="Question",
+                    strategy_model="model:1",
+                    answer_model="model:1",
+                    final_answer_model="model:1",
+                )
+            )
+
+    assert excinfo.value.error_code == "network_error"
+    assert "connection refused" in excinfo.value.message
+    assert excinfo.value.hint
+    assert excinfo.value.request_id
+
+
+def test_ask_tools_translate_a_read_timeout_into_a_structured_error(monkeypatch):
+    """A raw HTTPX timeout must not escape the ask tools."""
+    import asyncio
+
+    import httpx
+    import pytest
+
+    from open_notebook_mcp import server
+
+    with _mock_api(monkeypatch) as mock:
+        mock.post(f"{API_BASE}/api/search/ask").mock(
+            side_effect=httpx.ReadTimeout("read timed out")
+        )
+        with pytest.raises(server.ToolTimeoutError) as excinfo:
+            asyncio.run(
+                server.ask_simple(
+                    question="Question",
+                    strategy_model="model:1",
+                    answer_model="model:1",
+                    final_answer_model="model:1",
+                )
+            )
+
+    assert excinfo.value.error_code == "timeout"
+    assert excinfo.value.hint
+
+
 def test_list_artifacts_publishes_its_paging_knobs():
     """The capability index has to describe the knobs the tool really has."""
     capability = next(cap for cap in CAPABILITIES if cap.name == "list_artifacts")
