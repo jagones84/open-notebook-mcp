@@ -1,9 +1,10 @@
 """Tests for the Open Notebook MCP server."""
 
 import json
+from collections.abc import AsyncIterator
 
 import respx
-from httpx import Response
+from httpx import AsyncByteStream, Response
 
 from open_notebook_mcp.server import CAPABILITIES, search_capabilities
 
@@ -123,7 +124,7 @@ def test_create_source_posts_to_the_json_endpoint(monkeypatch):
     """POST /api/sources is multipart-only; the JSON contract lives at /sources/json."""
     import asyncio
 
-    import open_notebook_mcp.server as server
+    from open_notebook_mcp import server
 
     with _mock_api(monkeypatch) as mock:
         route = mock.post(f"{API_BASE}/api/sources/json").mock(
@@ -142,7 +143,262 @@ def test_create_source_posts_to_the_json_endpoint(monkeypatch):
     assert sent["notebook_id"] == "notebook:1"
     assert sent["type"] == "link"
     assert sent["embed"] is False
+    assert sent["async_processing"] is True
     assert result["source"]["id"] == "source:1"
+
+
+def test_create_source_sends_text_content_and_async_processing(monkeypatch):
+    """Text sources need content and should use the non-blocking API path."""
+    import asyncio
+
+    from open_notebook_mcp import server
+
+    with _mock_api(monkeypatch) as mock:
+        route = mock.post(f"{API_BASE}/api/sources/json").mock(
+            return_value=Response(200, json={"id": "source:text"})
+        )
+        result = asyncio.run(
+            server.create_source(
+                notebook_id="notebook:1",
+                type="text",
+                content="Source body",
+                title="Text source",
+            )
+        )
+
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["type"] == "text"
+    assert sent["content"] == "Source body"
+    assert sent["async_processing"] is True
+    assert result["source"]["id"] == "source:text"
+
+
+def test_create_source_rejects_text_without_content(monkeypatch):
+    """Reject text sources before making a request when content is missing."""
+    import asyncio
+
+    import pytest
+
+    from open_notebook_mcp import server
+
+    with _mock_api(monkeypatch), pytest.raises(ValueError, match="content is required"):
+        asyncio.run(server.create_source(notebook_id="notebook:1", type="text"))
+
+
+def test_create_source_rejects_link_without_url(monkeypatch):
+    """Reject links before making a request when URL is missing."""
+    import asyncio
+
+    import pytest
+
+    from open_notebook_mcp import server
+
+    with _mock_api(monkeypatch), pytest.raises(ValueError, match="url is required"):
+        asyncio.run(server.create_source(notebook_id="notebook:1", type="link"))
+
+
+def test_create_source_rejects_uploads_without_a_file_transfer_contract(monkeypatch):
+    """MCP cannot upload a local file because the tool has no file input."""
+    import asyncio
+
+    import pytest
+
+    from open_notebook_mcp import server
+
+    with (
+        _mock_api(monkeypatch),
+        pytest.raises(ValueError, match="upload sources are not supported"),
+    ):
+        asyncio.run(server.create_source(notebook_id="notebook:1", type="upload"))
+
+
+def test_create_source_capability_documents_text_and_async_inputs():
+    """Tool discovery must expose the supported source input contract."""
+    capability = next(cap for cap in CAPABILITIES if cap.name == "create_source")
+
+    assert capability.args["content"] == "Optional[str]"
+    assert capability.args["async_processing"] == "bool"
+    assert "upload" not in capability.summary
+
+
+def test_ask_question_parses_streamed_strategy_answers_and_final_answer(monkeypatch):
+    """The detailed ask tool returns decoded SSE events instead of raw frames."""
+    import asyncio
+
+    from open_notebook_mcp import server
+
+    events = [
+        {
+            "type": "strategy",
+            "reasoning": "Find evidence",
+            "searches": [{"term": "AI"}],
+        },
+        {"type": "answer", "content": "Partial answer"},
+        {"type": "final_answer", "content": "Final answer"},
+        {"type": "complete", "final_answer": "Final answer"},
+    ]
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+    with _mock_api(monkeypatch) as mock:
+        route = mock.post(f"{API_BASE}/api/search/ask").mock(
+            return_value=Response(
+                200,
+                text=body,
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+        result = asyncio.run(
+            server.ask_question(
+                question="What is AI?",
+                strategy_model="model:1",
+                answer_model="model:1",
+                final_answer_model="model:1",
+                notebook_id="notebook:1",
+            )
+        )
+
+    sent = json.loads(route.calls.last.request.content)
+    assert route.calls.last.request.headers["accept"] == "text/event-stream"
+    assert sent["question"] == "What is AI?"
+    assert sent["notebook_id"] == "notebook:1"
+    assert result["result"] == {
+        "question": "What is AI?",
+        "strategy": "Find evidence",
+        "searches": [{"term": "AI"}],
+        "answers": ["Partial answer"],
+        "final_answer": "Final answer",
+    }
+
+
+def test_ask_simple_returns_final_answer_from_stream(monkeypatch):
+    """The simple ask tool keeps its compact answer contract over SSE."""
+    import asyncio
+
+    from open_notebook_mcp import server
+
+    events = [
+        {"type": "final_answer", "content": "Concise answer"},
+        {"type": "complete", "final_answer": "Concise answer"},
+    ]
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+    with _mock_api(monkeypatch) as mock:
+        route = mock.post(f"{API_BASE}/api/search/ask").mock(
+            return_value=Response(
+                200,
+                text=body,
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+        result = asyncio.run(
+            server.ask_simple(
+                question="Summarize this",
+                strategy_model="model:1",
+                answer_model="model:1",
+                final_answer_model="model:1",
+            )
+        )
+
+    assert route.calls.last.request.headers["accept"] == "text/event-stream"
+    assert result["result"] == {
+        "question": "Summarize this",
+        "answer": "Concise answer",
+    }
+
+
+def test_ask_tools_raise_actionable_error_from_error_event(monkeypatch):
+    """An SSE error event must not be returned as if the ask succeeded."""
+    import asyncio
+
+    import pytest
+
+    from open_notebook_mcp import server
+
+    body = f"data: {json.dumps({'type': 'error', 'message': 'Model unavailable'})}\n\n"
+    with _mock_api(monkeypatch) as mock:
+        mock.post(f"{API_BASE}/api/search/ask").mock(
+            return_value=Response(
+                200,
+                text=body,
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+        with pytest.raises(RuntimeError, match="Model unavailable"):
+            asyncio.run(
+                server.ask_simple(
+                    question="Question",
+                    strategy_model="model:1",
+                    answer_model="model:1",
+                    final_answer_model="model:1",
+                )
+            )
+
+
+def test_ask_tools_reject_streams_that_end_without_completion(monkeypatch):
+    """A partial stream must not be reported as a successful answer."""
+    import asyncio
+
+    import pytest
+
+    from open_notebook_mcp import server
+
+    body = f"data: {json.dumps({'type': 'final_answer', 'content': 'Partial'})}\n\n"
+    with _mock_api(monkeypatch) as mock:
+        mock.post(f"{API_BASE}/api/search/ask").mock(
+            return_value=Response(
+                200,
+                text=body,
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+        with pytest.raises(RuntimeError, match="ended before completion"):
+            asyncio.run(
+                server.ask_simple(
+                    question="Question",
+                    strategy_model="model:1",
+                    answer_model="model:1",
+                    final_answer_model="model:1",
+                )
+            )
+
+
+def test_ask_tools_enforce_an_overall_stream_deadline(monkeypatch):
+    """Frequent SSE heartbeats cannot extend the total request deadline."""
+    import asyncio
+
+    import pytest
+
+    from open_notebook_mcp import server
+
+    class HeartbeatStream(AsyncByteStream):
+        """Emit regular heartbeats until the overall deadline expires."""
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                yield b": keep-alive\n\n"
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(server, "DEFAULT_TIMEOUT_S", 0.05)
+    with _mock_api(monkeypatch) as mock:
+        mock.post(f"{API_BASE}/api/search/ask").mock(
+            return_value=Response(
+                200,
+                stream=HeartbeatStream(),
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+        with pytest.raises(TimeoutError, match="overall deadline"):
+            asyncio.run(
+                server.ask_simple(
+                    question="Question",
+                    strategy_model="model:1",
+                    answer_model="model:1",
+                    final_answer_model="model:1",
+                )
+            )
 
 
 def test_timeout_reader_accepts_a_positive_finite_value():
@@ -203,7 +459,7 @@ def test_list_artifacts_defaults_to_a_small_page(monkeypatch):
 
 
 def test_list_artifacts_caps_the_limit(monkeypatch):
-    """The cap has to stay under the 200 ceiling of AGENTS.md 4.1."""
+    """The cap has to stay at the 200 ceiling of AGENTS.md 4.1."""
     import asyncio
 
     import open_notebook_mcp.server as server
@@ -214,10 +470,10 @@ def test_list_artifacts_caps_the_limit(monkeypatch):
         mock.get(f"{API_BASE}/api/artifacts").mock(
             return_value=Response(200, json=rows)
         )
-        page = asyncio.run(server.list_artifacts(limit=1000))
+        page = asyncio.run(server.list_artifacts(limit=200))
 
-    assert len(page["artifacts"]) == 100
-    assert page["limit"] == 100
+    assert len(page["artifacts"]) == 200
+    assert page["limit"] == 200
 
 
 def test_list_artifacts_closes_the_cursor(monkeypatch):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import math
 import os
@@ -20,8 +22,10 @@ mcp = FastMCP("open-notebook-mcp")
 # Configuration and Constants
 # -----------------------------
 
-# Maximum number of items to return in list operations
-MAX_LIMIT = 100
+# Maximum number of items to return in list operations.
+# AGENTS.md 4.1 caps list/search tools at 200 items per page.
+MAX_LIMIT = 200
+
 
 def _read_timeout_s(raw: str) -> float:
     """Return the HTTP timeout in seconds, refusing values httpx accepts silently.
@@ -68,6 +72,131 @@ def get_auth_token() -> Optional[str]:
 def generate_request_id() -> str:
     """Generate a unique request ID for tracking."""
     return str(uuid.uuid4())
+
+
+class ToolError(Exception):
+    """Structured tool error with the fields AGENTS.md section 6 requires.
+
+    Args:
+        error_code: Stable machine-readable code, for example 'invalid_input'.
+        message: What went wrong, in one sentence.
+        hint: Actionable next step for the caller.
+        request_id: Correlation ID for the server logs.
+    """
+
+    def __init__(
+        self,
+        error_code: str,
+        message: str,
+        hint: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.message = message
+        self.hint = hint
+        self.request_id = request_id or generate_request_id()
+
+    def to_dict(self) -> dict[str, str]:
+        """Return the error as the structured payload of AGENTS.md section 6.
+
+        Returns:
+            The error code, message, hint and request ID.
+        """
+        return {
+            "error_code": self.error_code,
+            "message": self.message,
+            "hint": self.hint,
+            "request_id": self.request_id,
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"{self.error_code}: {self.message} "
+            f"(hint: {self.hint}, request_id: {self.request_id})"
+        )
+
+
+class ToolInputError(ToolError, ValueError):
+    """Input rejected before the request left the process."""
+
+
+class ToolApiError(ToolError, RuntimeError):
+    """The Open Notebook API refused or failed the request."""
+
+
+class ToolTimeoutError(ToolError, TimeoutError):
+    """The request exceeded its deadline."""
+
+
+def _require_text(
+    value: Optional[str],
+    field: str,
+    hint: str,
+    max_length: Optional[int] = None,
+) -> str:
+    """Return a trimmed non-empty value, or raise a structured input error.
+
+    Args:
+        value: The value to check.
+        field: Name of the field, used in the error message.
+        hint: Actionable next step for the caller.
+        max_length: Optional maximum number of characters accepted.
+
+    Returns:
+        The trimmed value.
+
+    Raises:
+        ToolInputError: If the value is missing, blank, not a string or too long.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ToolInputError(
+            "invalid_input",
+            f"{field} is required and must be a non-empty string",
+            hint,
+        )
+    trimmed = value.strip()
+    if max_length is not None and len(trimmed) > max_length:
+        raise ToolInputError(
+            "invalid_input",
+            f"{field} must be at most {max_length} characters, got {len(trimmed)}",
+            hint,
+        )
+    return trimmed
+
+
+def _require_range(
+    value: int, field: str, minimum: int, maximum: int, hint: str
+) -> int:
+    """Return the value when it is inside the documented range.
+
+    Args:
+        value: The value to check.
+        field: Name of the field, used in the error message.
+        minimum: Lowest accepted value.
+        maximum: Highest accepted value.
+        hint: Actionable next step for the caller.
+
+    Returns:
+        The value, unchanged.
+
+    Raises:
+        ToolInputError: If the value is not an integer or is out of range.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolInputError(
+            "invalid_input",
+            f"{field} must be an integer",
+            hint,
+        )
+    if not minimum <= value <= maximum:
+        raise ToolInputError(
+            "invalid_input",
+            f"{field} must be between {minimum} and {maximum}, got {value}",
+            hint,
+        )
+    return value
+
 
 # -----------------------------
 # Capability index (source of truth)
@@ -164,11 +293,25 @@ CAPABILITIES: tuple[Capability, ...] = (
     ),
     Capability(
         name="create_source",
-        summary="Create a new source (link, upload, or text).",
+        summary="Create a link or text source asynchronously.",
         tags=("sources", "create", "write"),
-        args={"notebook_id": "str", "type": "str", "url": "Optional[str]", "title": "Optional[str]", "embed": "bool"},
+        args={
+            "notebook_id": "str",
+            "type": "Literal['link','text']",
+            "url": "Optional[str]",
+            "content": "Optional[str]",
+            "title": "Optional[str]",
+            "embed": "bool",
+            "async_processing": "bool",
+        },
         returns="dict[str, Any]",
-        example={"notebook_id": "notebook:abc123", "type": "link", "url": "https://example.com", "embed": True},
+        example={
+            "notebook_id": "notebook:abc123",
+            "type": "text",
+            "content": "Research notes",
+            "embed": True,
+            "async_processing": True,
+        },
         typical_bytes=2000,
     ),
     Capability(
@@ -608,8 +751,13 @@ async def make_request(
                 except (ValueError, AttributeError):
                     # If error response is not JSON, use text or default message
                     error_msg = e.response.text or error_msg
-            
-            raise Exception(f"API request failed: {error_msg}")
+
+            raise ToolApiError(
+                "api_error",
+                f"API request failed: {error_msg}",
+                "Check that OPEN_NOTEBOOK_URL points at a reachable Open Notebook API "
+                "and that the payload matches the endpoint contract.",
+            ) from e
 
 # -----------------------------
 # Notebooks API Tools
@@ -626,7 +774,7 @@ async def list_notebooks(
     Args:
         archived: Filter by archived status (None = all, True = archived only, False = active only)
         order_by: Order by field and direction (e.g., 'created desc', 'name asc')
-        limit: Maximum number of results (1-100)
+        limit: Maximum number of results (1-200)
     
     Returns:
         Dictionary with notebooks list and metadata
@@ -747,7 +895,7 @@ async def list_sources(
     
     Args:
         notebook_id: Optional notebook ID to filter by
-        limit: Maximum number of results (1-100)
+        limit: Maximum number of results (1-200)
         offset: Pagination offset
     
     Returns:
@@ -784,38 +932,76 @@ async def get_source(source_id: str) -> dict[str, Any]:
 @mcp.tool()
 async def create_source(
     notebook_id: str,
-    type: str,
-    url: Optional[str] = None,
-    title: Optional[str] = None,
+    type: Literal["link", "text"],
+    url: str | None = None,
+    content: str | None = None,
+    title: str | None = None,
     embed: bool = True,
+    async_processing: bool = True,
 ) -> dict[str, Any]:
-    """Create a new source (link, upload, or text).
-    
+    """Create a link or text source.
+
     Args:
         notebook_id: Notebook ID to add source to
-        type: Source type ('link', 'upload', or 'text')
+        type: Source type ('link' or 'text')
         url: URL for link type sources
+        content: Text for text type sources
         title: Optional title
         embed: Whether to generate embeddings (default: True)
-    
+        async_processing: Whether to process the source asynchronously
+
     Returns:
         Created source details
     """
+    if type not in ("link", "text"):
+        raise ToolInputError(
+            "invalid_input",
+            "upload sources are not supported because MCP cannot transfer files",
+            "Use type='link' with a url, or type='text' with content.",
+        )
+    notebook_id = _require_text(
+        notebook_id,
+        "notebook_id",
+        "Pass a notebook ID, or create one first with create_notebook.",
+    )
+    if type == "link":
+        url = _require_text(
+            url,
+            "url",
+            "Pass the page to add, for example 'https://example.com/post'.",
+        )
+    elif type == "text":
+        content = _require_text(
+            content,
+            "content",
+            "Pass the text to add, or use type='link' with a url.",
+        )
+    if title is not None:
+        title = _require_text(
+            title,
+            "title",
+            "Pass a non-empty title, or omit it to let the API pick one.",
+        )
+
     data = {
         "notebook_id": notebook_id,
         "type": type,
         "embed": embed,
+        "async_processing": async_processing,
     }
     if url is not None:
         data["url"] = url
+    if content is not None:
+        data["content"] = content
     if title is not None:
         data["title"] = title
-    
+
     source = await make_request("POST", "/api/sources/json", json_data=data)
     return {
         "request_id": generate_request_id(),
         "source": source,
     }
+
 
 @mcp.tool()
 async def update_source(
@@ -875,7 +1061,7 @@ async def list_notes(
     
     Args:
         notebook_id: Optional notebook ID to filter by
-        limit: Maximum number of results (1-100)
+        limit: Maximum number of results (1-200)
         offset: Pagination offset
     
     Returns:
@@ -1054,6 +1240,162 @@ async def _resolve_models(
     )
 
 
+def _consume_ask_event(payload: str, result: dict[str, Any]) -> bool:
+    """Apply one decoded SSE event and return whether it completed the stream.
+
+    Args:
+        payload: JSON payload from an SSE data field.
+        result: Mutable accumulator for the ask response.
+
+    Returns:
+        True when the event is the stream completion marker.
+
+    Raises:
+        ToolApiError: If the event is malformed or reports an ask error.
+    """
+    try:
+        event = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ToolApiError(
+            "invalid_stream",
+            "Open Notebook returned an invalid SSE event",
+            "The ask endpoint must send one JSON object per 'data:' line.",
+        ) from exc
+    if not isinstance(event, dict):
+        raise ToolApiError(
+            "invalid_stream",
+            "Open Notebook returned an invalid SSE event",
+            "The ask endpoint must send one JSON object per 'data:' line.",
+        )
+
+    event_type = event.get("type")
+    if event_type == "strategy":
+        result["strategy"] = event.get("reasoning")
+        result["searches"] = event.get("searches", [])
+    elif event_type == "answer":
+        result["answers"].append(event.get("content", ""))
+    elif event_type == "final_answer":
+        result["final_answer"] = event.get("content")
+    elif event_type == "complete":
+        result["final_answer"] = event.get("final_answer") or result["final_answer"]
+        return True
+    elif event_type == "error":
+        message = event.get("message") or "Open Notebook ask stream failed"
+        raise ToolApiError(
+            "ask_failed",
+            str(message),
+            "The upstream ask job failed; check the notebook's models and sources.",
+        )
+    return False
+
+
+async def _stream_ask(data: dict[str, Any]) -> dict[str, Any]:
+    """Read and decode the Open Notebook ask endpoint as Server-Sent Events.
+
+    Args:
+        data: Validated ask request body.
+
+    Returns:
+        Strategy, searches, partial answers, and final answer.
+
+    Raises:
+        ToolApiError: If the upstream response or event stream is invalid.
+        ToolTimeoutError: If the complete request exceeds the configured deadline.
+    """
+    base_url = get_base_url()
+    url = f"{base_url}/api/search/ask"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    auth_token = get_auth_token()
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    result: dict[str, Any] = {
+        "strategy": None,
+        "searches": [],
+        "answers": [],
+        "final_answer": None,
+    }
+    completed = False
+
+    try:
+        async with (
+            asyncio.timeout(DEFAULT_TIMEOUT_S),
+            httpx.AsyncClient(
+                follow_redirects=True, timeout=DEFAULT_TIMEOUT_S
+            ) as client,
+            client.stream("POST", url, headers=headers, json=data) as response,
+        ):
+            if not response.is_success:
+                body = await response.aread()
+                message = body.decode("utf-8", "replace").strip()
+                try:
+                    error_body = json.loads(message)
+                    if isinstance(error_body, dict):
+                        message = str(
+                            error_body.get("detail")
+                            or error_body.get("message")
+                            or message
+                        )
+                except json.JSONDecodeError:
+                    pass
+                raise ToolApiError(
+                    "api_error",
+                    f"API request failed ({response.status_code}): "
+                    f"{message or response.reason_phrase}",
+                    "The ask endpoint refused the request; check the payload and the "
+                    "notebook's models.",
+                )
+
+            content_type = response.headers.get("content-type", "")
+            if not content_type.lower().startswith("text/event-stream"):
+                raise ToolApiError(
+                    "invalid_stream",
+                    "Open Notebook ask endpoint did not return an SSE stream",
+                    "Point OPEN_NOTEBOOK_URL at the API port, not the web UI port, "
+                    "or use an instance that serves /api/search/ask as SSE.",
+                )
+
+            event_data: list[str] = []
+            async for line in response.aiter_lines():
+                if line == "":
+                    if event_data:
+                        completed = _consume_ask_event("\n".join(event_data), result)
+                        event_data.clear()
+                        if completed:
+                            break
+                elif line.startswith(":"):
+                    continue
+                elif line.startswith("data:"):
+                    value = line[5:]
+                    event_data.append(value.removeprefix(" "))
+
+            if event_data and not completed:
+                completed = _consume_ask_event("\n".join(event_data), result)
+    except TimeoutError as exc:
+        raise ToolTimeoutError(
+            "timeout",
+            f"Ask request exceeded the {DEFAULT_TIMEOUT_S:g}s overall deadline",
+            "Raise OPEN_NOTEBOOK_TIMEOUT_S, or ask a shorter question.",
+        ) from exc
+
+    if not completed:
+        raise ToolApiError(
+            "incomplete_stream",
+            "Open Notebook ask stream ended before completion",
+            "The upstream stream closed without a 'complete' event; retry the question.",
+        )
+    if not result["final_answer"]:
+        raise ToolApiError(
+            "incomplete_stream",
+            "Open Notebook ask stream completed without a final answer",
+            "The upstream stream carried no final answer; retry the question.",
+        )
+    return result
+
+
 @mcp.tool()
 async def ask_question(
     question: str,
@@ -1063,14 +1405,14 @@ async def ask_question(
     notebook_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Ask a question about your content with detailed control.
-    
+
     Args:
         question: Question to ask
         strategy_model: Model ID for strategy generation
         answer_model: Model ID for answering
         final_answer_model: Model ID for final answer synthesis
         notebook_id: Optional notebook ID to limit context
-    
+
     Returns:
         Answer with sources and reasoning
     """
@@ -1086,12 +1428,19 @@ async def ask_question(
     }
     if notebook_id is not None:
         data["notebook_id"] = notebook_id
-    
-    result = await make_request("POST", "/api/search/ask", json_data=data)
+
+    streamed = await _stream_ask(data)
     return {
         "request_id": generate_request_id(),
-        "result": result,
+        "result": {
+            "question": question,
+            "strategy": streamed["strategy"],
+            "searches": streamed["searches"],
+            "answers": streamed["answers"],
+            "final_answer": streamed["final_answer"],
+        },
     }
+
 
 @mcp.tool()
 async def ask_simple(
@@ -1102,14 +1451,14 @@ async def ask_simple(
     notebook_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Ask a question about your content with simplified interface.
-    
+
     Args:
         question: Question to ask
         strategy_model: Model ID for strategy generation
         answer_model: Model ID for answering
         final_answer_model: Model ID for final answer synthesis
         notebook_id: Optional notebook ID to limit context
-    
+
     Returns:
         Simple answer
     """
@@ -1125,11 +1474,14 @@ async def ask_simple(
     }
     if notebook_id is not None:
         data["notebook_id"] = notebook_id
-    
-    result = await make_request("POST", "/api/search/ask/simple", json_data=data)
+
+    streamed = await _stream_ask(data)
     return {
         "request_id": generate_request_id(),
-        "result": result,
+        "result": {
+            "question": question,
+            "answer": streamed["final_answer"],
+        },
     }
 
 # -----------------------------
@@ -1141,7 +1493,7 @@ async def list_models(limit: int = 50) -> dict[str, Any]:
     """Get all configured AI models.
     
     Args:
-        limit: Maximum number of results (1-100)
+        limit: Maximum number of results (1-200)
     
     Returns:
         Dictionary with models list and metadata
@@ -1240,7 +1592,7 @@ async def list_chat_sessions(
     
     Args:
         notebook_id: Optional notebook ID to filter by
-        limit: Maximum number of results (1-100)
+        limit: Maximum number of results (1-200)
     
     Returns:
         Dictionary with sessions list and metadata
@@ -1464,7 +1816,39 @@ async def discover_sources(
         The provider used, how many sources were created, how many were skipped
         because the notebook already had them, and every hit with its outcome.
     """
-    limit = max(1, min(limit, 20))
+    limit = _require_range(
+        limit,
+        "limit",
+        1,
+        20,
+        "Ask for between 1 and 20 sources per call.",
+    )
+    query = _require_text(
+        query,
+        "query",
+        "Give a non-empty topic to search for, for example 'MCP protocol specification'.",
+        max_length=400,
+    )
+    notebook_id = _require_text(
+        notebook_id,
+        "notebook_id",
+        "Pass a notebook ID, or create one first with create_notebook.",
+    )
+    if provider is not None:
+        provider = _require_text(
+            provider,
+            "provider",
+            "Pass the exact backend name, for example 'tavily'.",
+        )
+    if exclude_domains is not None:
+        exclude_domains = [
+            _require_text(
+                domain,
+                "exclude_domains",
+                "Pass domains as bare names, without scheme, path or port.",
+            ).lower()
+            for domain in exclude_domains
+        ]
     data: dict[str, Any] = {
         "query": query,
         "notebook_id": notebook_id,
@@ -1481,6 +1865,20 @@ async def discover_sources(
         "request_id": generate_request_id(),
         "result": result,
     }
+
+
+#: Formats the API can render (api/routers/artifacts.py MEDIA_TYPES).
+ARTIFACT_FORMATS: tuple[str, ...] = ("md", "html", "docx", "pptx")
+
+#: Valid artifact kinds; 'slides' is the legacy alias of 'deck'.
+ARTIFACT_KINDS: tuple[str, ...] = ("report", "deck", "slides")
+
+#: Valid variant per kind (open_notebook/artifacts/outline.py VARIANTS).
+ARTIFACT_VARIANTS: dict[str, tuple[str, ...]] = {
+    "report": ("document", "illustrated"),
+    "deck": ("presenter", "detailed"),
+}
+
 
 @mcp.tool()
 async def generate_artifact(
@@ -1525,10 +1923,87 @@ async def generate_artifact(
         A command_id and an artifact_id. Generation runs in the background, so
         poll get_artifact with the artifact_id until job_status settles.
     """
+    notebook_id = _require_text(
+        notebook_id,
+        "notebook_id",
+        "Pass a notebook ID, or create one first with create_notebook.",
+    )
+    kind = _require_text(
+        kind,
+        "kind",
+        "Use 'report' for prose or 'deck' for slides.",
+    )
+    if kind not in ARTIFACT_KINDS:
+        raise ToolInputError(
+            "invalid_input",
+            f"kind must be one of {', '.join(ARTIFACT_KINDS)}, got {kind!r}",
+            "Use 'report' for prose or 'deck' for slides.",
+        )
+    normalized_kind = "deck" if kind == "slides" else kind
+    if variant is not None:
+        variant = _require_text(
+            variant,
+            "variant",
+            f"Use one of {', '.join(ARTIFACT_VARIANTS[normalized_kind])}.",
+        ).lower()
+        if variant not in ARTIFACT_VARIANTS[normalized_kind]:
+            raise ToolInputError(
+                "invalid_input",
+                f"variant {variant!r} is not valid for a {normalized_kind}",
+                f"Use one of {', '.join(ARTIFACT_VARIANTS[normalized_kind])}.",
+            )
+    if formats is None:
+        formats = ["md", "docx"]
+    else:
+        formats = [
+            _require_text(
+                fmt,
+                "formats",
+                "Pass formats as bare names, for example 'md'.",
+            )
+            for fmt in formats
+        ]
+        unsupported = [fmt for fmt in formats if fmt not in ARTIFACT_FORMATS]
+        if unsupported:
+            raise ToolInputError(
+                "invalid_input",
+                f"unsupported artifact formats: {', '.join(unsupported)}",
+                f"Supported formats are {', '.join(ARTIFACT_FORMATS)}.",
+            )
+    sections = _require_range(
+        sections,
+        "sections",
+        1,
+        50,
+        "Ask for between 1 and 50 sections.",
+    )
+    language = _require_text(
+        language,
+        "language",
+        "Pass a language name, for example 'en'.",
+    )
+    if title is not None:
+        title = _require_text(
+            title,
+            "title",
+            "Pass a non-empty title, or omit it to let the API pick one.",
+        )
+    if instructions is not None:
+        instructions = _require_text(
+            instructions,
+            "instructions",
+            "Pass non-empty guidance for the writer, or omit it.",
+        )
+    if model_id is not None:
+        model_id = _require_text(
+            model_id,
+            "model_id",
+            "Pass the model id to use, for example 'openai/gpt-4o-mini'.",
+        )
     data: dict[str, Any] = {
         "notebook_id": notebook_id,
         "kind": kind,
-        "formats": formats or ["md", "docx"],
+        "formats": formats,
         "language": language,
         "sections": sections,
     }
@@ -1546,6 +2021,9 @@ async def generate_artifact(
         "request_id": generate_request_id(),
         "result": result,
     }
+
+#: Detail levels accepted by list_artifacts.
+ARTIFACT_DETAIL_LEVELS: tuple[str, ...] = ("name", "summary", "full")
 
 #: Preset key sets for the detail levels of the artifact list, so a listing can
 #: stay cheap in the model's context. 'full' is absent: it keeps the whole row.
@@ -1597,7 +2075,7 @@ async def list_artifacts(
 
     Args:
         notebook_id: Optional notebook ID to filter by.
-        limit: How many artifacts to return (1-100, default 25).
+        limit: How many artifacts to return (1-200, default 25).
         offset: How many artifacts to skip, for paging.
         fields: Optional list of row keys to keep, for example ['id', 'title'].
             Wins over detail when both are given.
@@ -1609,14 +2087,47 @@ async def list_artifacts(
         The page of artifacts plus total, offset, limit and the next_offset to
         pass for the following page (None once the list is exhausted).
     """
-    limit = max(1, min(limit, MAX_LIMIT))
-    offset = max(0, offset)
+    limit = _require_range(
+        limit,
+        "limit",
+        1,
+        MAX_LIMIT,
+        f"Ask for between 1 and {MAX_LIMIT} artifacts per call.",
+    )
+    offset = _require_range(
+        offset,
+        "offset",
+        0,
+        1_000_000,
+        "Pass offset 0 for the first page.",
+    )
+    if notebook_id is not None:
+        notebook_id = _require_text(
+            notebook_id,
+            "notebook_id",
+            "Pass a notebook ID, or leave it out to list every notebook.",
+        )
+    if detail not in ARTIFACT_DETAIL_LEVELS:
+        raise ToolInputError(
+            "invalid_input",
+            f"detail must be one of {', '.join(ARTIFACT_DETAIL_LEVELS)}, got {detail!r}",
+            "Use 'summary' for the default row, 'name' for id and title only.",
+        )
+    if fields is not None:
+        fields = [
+            _require_text(
+                field,
+                "fields",
+                "Pass field names as strings, for example ['id', 'title'].",
+            )
+            for field in fields
+        ]
     params: dict[str, Any] = {}
     if notebook_id is not None:
         params["notebook_id"] = notebook_id
 
     artifacts = await make_request("GET", "/api/artifacts", params=params)
-    rows = artifacts if isinstance(artifacts, list) else []
+    rows: list[Any] = artifacts if isinstance(artifacts, list) else []
     total = len(rows)
     page = [
         _select_artifact_fields(row, fields, detail)
@@ -1643,6 +2154,11 @@ async def get_artifact(artifact_id: str) -> dict[str, Any]:
     Returns:
         Artifact details with job_status, error_message and download_url.
     """
+    artifact_id = _require_text(
+        artifact_id,
+        "artifact_id",
+        "Pass the artifact ID, for example 'artifact:abc123'.",
+    )
     artifact = await make_request("GET", f"/api/artifacts/{artifact_id}")
     return {
         "request_id": generate_request_id(),
@@ -1659,6 +2175,11 @@ async def delete_artifact(artifact_id: str) -> dict[str, Any]:
     Returns:
         Success message.
     """
+    artifact_id = _require_text(
+        artifact_id,
+        "artifact_id",
+        "Pass the artifact ID, for example 'artifact:abc123'.",
+    )
     result = await make_request("DELETE", f"/api/artifacts/{artifact_id}")
     return {
         "request_id": generate_request_id(),
