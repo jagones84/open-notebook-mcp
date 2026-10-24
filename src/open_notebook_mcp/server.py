@@ -26,6 +26,19 @@ mcp = FastMCP("open-notebook-mcp")
 # AGENTS.md 4.1 caps list/search tools at 200 items per page.
 MAX_LIMIT = 200
 
+# Ceiling the discovery endpoint accepts for one run (api/models.py
+# DiscoverSourcesRequest.limit). The provider never returns more candidates
+# than this, so a page of discovered hits cannot grow beyond it.
+DISCOVER_LIMIT_MAX = 20
+
+# Ceiling the discovery endpoint accepts for the excluded-domain list
+# (api/models.py DiscoverSourcesRequest.exclude_domains).
+DISCOVER_EXCLUDE_DOMAINS_MAX = 50
+
+# Ceiling the sources endpoint accepts for one page (api/routers/sources.py
+# get_sources). Asking for more makes the upstream answer 422.
+SOURCES_LIMIT_MAX = 100
+
 
 def _read_timeout_s(raw: str) -> float:
     """Return the HTTP timeout in seconds, refusing values httpx accepts silently.
@@ -206,6 +219,81 @@ def _require_range(
 
 Detail = Literal["name", "summary", "full"]
 
+#: Detail levels accepted by every list/search tool.
+DETAIL_LEVELS: tuple[str, ...] = ("name", "summary", "full")
+
+
+def _require_detail(detail: str, levels: tuple[str, ...]) -> str:
+    """Return the detail level when the tool publishes it.
+
+    Args:
+        detail: Requested detail level.
+        levels: Detail levels the tool accepts.
+
+    Returns:
+        The detail level, unchanged.
+
+    Raises:
+        ToolInputError: If the level is not one the tool documents.
+    """
+    if detail not in levels:
+        raise ToolInputError(
+            "invalid_input",
+            f"detail must be one of {', '.join(levels)}, got {detail!r}",
+            "Use 'summary' for the default row, 'name' for the smallest one.",
+        )
+    return detail
+
+
+def _require_fields(fields: Optional[list[str]]) -> Optional[list[str]]:
+    """Return the requested row keys after trimming them.
+
+    Args:
+        fields: Row keys the caller wants to keep, or None.
+
+    Returns:
+        The trimmed keys, or None when nothing was asked for.
+
+    Raises:
+        ToolInputError: If a key is blank or not a string.
+    """
+    if fields is None:
+        return None
+    return [
+        _require_text(
+            field,
+            "fields",
+            "Pass field names as strings, for example ['id', 'title'].",
+        )
+        for field in fields
+    ]
+
+
+def _select_fields(
+    record: Any,
+    fields: Optional[list[str]],
+    detail: str,
+    presets: dict[str, tuple[str, ...]],
+) -> Any:
+    """Project one API row down to the keys the caller asked for.
+
+    Args:
+        record: One row returned by the API.
+        fields: Explicit keys to keep, or None to use the detail preset.
+        detail: Detail preset name.
+        presets: Key sets per detail level; a missing level keeps the row whole.
+
+    Returns:
+        The projected row, or the row untouched when nothing was asked for.
+    """
+    if not isinstance(record, dict):
+        return record
+    keys = fields if fields else presets.get(detail)
+    if not keys:
+        return record
+    return {key: record[key] for key in keys if key in record}
+
+
 @dataclass(frozen=True)
 class Capability:
     name: str                 # tool name
@@ -275,11 +363,17 @@ CAPABILITIES: tuple[Capability, ...] = (
     # Sources API
     Capability(
         name="list_sources",
-        summary="Get all sources with optional filtering.",
+        summary="Get sources with optional filtering, paged.",
         tags=("sources", "list", "query"),
-        args={"notebook_id": "Optional[str]", "limit": "int", "offset": "int"},
+        args={
+            "notebook_id": "Optional[str]",
+            "limit": "int",
+            "offset": "int",
+            "fields": "Optional[list[str]]",
+            "detail": "Literal['name','summary','full']",
+        },
         returns="dict[str, Any]",
-        example={"notebook_id": "notebook:abc123", "limit": 20, "offset": 0},
+        example={"notebook_id": "notebook:abc123", "limit": 25, "detail": "summary"},
         typical_bytes=3000,
     ),
     Capability(
@@ -548,6 +642,8 @@ CAPABILITIES: tuple[Capability, ...] = (
             "embed": "bool",
             "exclude_domains": "Optional[list[str]]",
             "dry_run": "bool",
+            "fields": "Optional[list[str]]",
+            "detail": "Literal['name','summary','full']",
         },
         returns="dict[str, Any]",
         example={
@@ -555,6 +651,7 @@ CAPABILITIES: tuple[Capability, ...] = (
             "notebook_id": "notebook:abc123",
             "limit": 5,
             "dry_run": True,
+            "detail": "summary",
         },
         typical_bytes=4000,
     ),
@@ -885,32 +982,85 @@ async def delete_notebook(notebook_id: str) -> dict[str, Any]:
 # Sources API Tools
 # -----------------------------
 
+#: Detail presets for the source rows (api/models.py SourceListResponse).
+#: 'full' is absent on purpose: it keeps the whole row.
+SOURCE_DETAIL_FIELDS: dict[str, tuple[str, ...]] = {
+    "name": ("id", "title"),
+    "summary": (
+        "id",
+        "title",
+        "topics",
+        "embedded",
+        "insights_count",
+        "status",
+        "updated",
+    ),
+}
+
+
 @mcp.tool()
 async def list_sources(
     notebook_id: Optional[str] = None,
-    limit: int = 20,
+    limit: int = 25,
     offset: int = 0,
+    fields: Optional[list[str]] = None,
+    detail: Detail = "summary",
 ) -> dict[str, Any]:
-    """Get all sources with optional filtering.
-    
+    """Get sources with optional filtering, paged.
+
     Args:
-        notebook_id: Optional notebook ID to filter by
-        limit: Maximum number of results (1-200)
-        offset: Pagination offset
-    
+        notebook_id: Optional notebook ID to filter by.
+        limit: Maximum number of results (1-100, default 25). The API refuses
+            more than 100 per page.
+        offset: Pagination offset, 0 for the first page.
+        fields: Optional list of row keys to keep, for example ['id', 'title'].
+            Wins over detail when both are given.
+        detail: Preset for how big a row is: 'name' (id and title), 'summary'
+            (adds topics, embedding state, insight count, status and date) or
+            'full' (the whole row).
+
     Returns:
-        Dictionary with sources list and metadata
+        The page of sources plus count, offset, limit and the next_offset to
+        pass for the following page (None once the API returns a short page).
     """
-    limit = max(1, min(limit, MAX_LIMIT))
-    params = {"limit": limit, "offset": offset}
+    limit = _require_range(
+        limit,
+        "limit",
+        1,
+        SOURCES_LIMIT_MAX,
+        f"Ask for between 1 and {SOURCES_LIMIT_MAX} sources per call: the API "
+        "pages at 100 and answers 422 above it.",
+    )
+    offset = _require_range(
+        offset,
+        "offset",
+        0,
+        1_000_000,
+        "Pass offset 0 for the first page.",
+    )
+    if notebook_id is not None:
+        notebook_id = _require_text(
+            notebook_id,
+            "notebook_id",
+            "Pass a notebook ID, or leave it out to list every notebook.",
+        )
+    detail = _require_detail(detail, DETAIL_LEVELS)
+    fields = _require_fields(fields)
+
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
     if notebook_id is not None:
         params["notebook_id"] = notebook_id
-    
+
     sources = await make_request("GET", "/api/sources", params=params)
+    rows = sources if isinstance(sources, list) else []
+    page = [_select_fields(row, fields, detail, SOURCE_DETAIL_FIELDS) for row in rows]
     return {
         "request_id": generate_request_id(),
-        "count": len(sources) if isinstance(sources, list) else 0,
-        "sources": sources,
+        "count": len(page),
+        "offset": offset,
+        "limit": limit,
+        "next_offset": offset + len(page) if len(rows) == limit else None,
+        "sources": page,
     }
 
 @mcp.tool()
@@ -929,29 +1079,31 @@ async def get_source(source_id: str) -> dict[str, Any]:
         "source": source,
     }
 
-@mcp.tool()
-async def create_source(
+def _build_source_payload(
     notebook_id: str,
-    type: Literal["link", "text"],
-    url: str | None = None,
-    content: str | None = None,
-    title: str | None = None,
-    embed: bool = True,
-    async_processing: bool = True,
+    type: str,
+    url: Optional[str],
+    content: Optional[str],
+    title: Optional[str],
+    embed: bool,
+    async_processing: bool,
 ) -> dict[str, Any]:
-    """Create a link or text source.
+    """Validate the source fields and build the API payload.
 
     Args:
-        notebook_id: Notebook ID to add source to
-        type: Source type ('link' or 'text')
-        url: URL for link type sources
-        content: Text for text type sources
-        title: Optional title
-        embed: Whether to generate embeddings (default: True)
-        async_processing: Whether to process the source asynchronously
+        notebook_id: Notebook the source belongs to.
+        type: Source type, 'link' or 'text'.
+        url: Page to add, for a link source.
+        content: Text to add, for a text source.
+        title: Optional title.
+        embed: Whether the source must be embedded.
+        async_processing: Whether the source is processed in the background.
 
     Returns:
-        Created source details
+        The payload for POST /api/sources/json.
+
+    Raises:
+        ToolInputError: If a required field is missing or invalid.
     """
     if type not in ("link", "text"):
         raise ToolInputError(
@@ -983,7 +1135,7 @@ async def create_source(
             "Pass a non-empty title, or omit it to let the API pick one.",
         )
 
-    data = {
+    data: dict[str, Any] = {
         "notebook_id": notebook_id,
         "type": type,
         "embed": embed,
@@ -995,6 +1147,42 @@ async def create_source(
         data["content"] = content
     if title is not None:
         data["title"] = title
+    return data
+
+
+@mcp.tool()
+async def create_source(
+    notebook_id: str,
+    type: Literal["link", "text"],
+    url: str | None = None,
+    content: str | None = None,
+    title: str | None = None,
+    embed: bool = True,
+    async_processing: bool = True,
+) -> dict[str, Any]:
+    """Create a link or text source.
+
+    Args:
+        notebook_id: Notebook ID to add source to
+        type: Source type ('link' or 'text')
+        url: URL for link type sources
+        content: Text for text type sources
+        title: Optional title
+        embed: Whether to generate embeddings (default: True)
+        async_processing: Whether to process the source asynchronously
+
+    Returns:
+        Created source details
+    """
+    data = _build_source_payload(
+        notebook_id,
+        type,
+        url,
+        content,
+        title,
+        embed,
+        async_processing,
+    )
 
     source = await make_request("POST", "/api/sources/json", json_data=data)
     return {
@@ -1802,38 +1990,46 @@ async def update_settings(settings: dict[str, Any]) -> dict[str, Any]:
 # They only exist on an instance built from the branch that adds them; against
 # an instance that does not serve them these tools return 404.
 
-@mcp.tool()
-async def discover_sources(
+#: Detail presets for the discovery hits (api/models.py DiscoveredSource).
+#: 'full' is absent on purpose: it keeps the whole row.
+DISCOVER_DETAIL_FIELDS: dict[str, tuple[str, ...]] = {
+    "name": ("title", "url"),
+    "summary": ("title", "url", "score", "status", "source_id"),
+}
+
+
+def _build_discover_payload(
     query: str,
     notebook_id: str,
-    limit: int = 5,
-    provider: Optional[str] = None,
-    embed: bool = False,
-    exclude_domains: Optional[list[str]] = None,
-    dry_run: bool = False,
+    limit: int,
+    provider: Optional[str],
+    embed: bool,
+    exclude_domains: Optional[list[str]],
+    dry_run: bool,
 ) -> dict[str, Any]:
-    """Search the web and attach the hits to a notebook as sources.
+    """Validate the discovery fields and build the API payload.
 
     Args:
-        query: What to search for (the topic to find sources about).
-        notebook_id: Notebook to attach the discovered sources to. Create one
-            first with create_notebook if the notebook does not exist yet.
-        limit: Maximum number of sources to create (1-20).
-        provider: Search backend name; omit to use the instance default.
-        embed: Embed the created sources so they are usable for vector search.
-        exclude_domains: Domains the provider must not return.
-        dry_run: Preview the ranked candidates without creating anything.
+        query: The topic to search for.
+        notebook_id: Notebook the discovered sources land in.
+        limit: How many candidates to ask the provider for.
+        provider: Optional search backend name.
+        embed: Whether the created sources must be embedded.
+        exclude_domains: Optional denylist of domains.
+        dry_run: Whether to preview without creating anything.
 
     Returns:
-        The provider used, how many sources were created, how many were skipped
-        because the notebook already had them, and every hit with its outcome.
+        The payload for POST /api/sources/discover.
+
+    Raises:
+        ToolInputError: If a field is missing, blank or outside the API range.
     """
     limit = _require_range(
         limit,
         "limit",
         1,
-        20,
-        "Ask for between 1 and 20 sources per call.",
+        DISCOVER_LIMIT_MAX,
+        f"Ask for between 1 and {DISCOVER_LIMIT_MAX} sources per call.",
     )
     query = _require_text(
         query,
@@ -1861,6 +2057,14 @@ async def discover_sources(
             ).lower()
             for domain in exclude_domains
         ]
+        if len(exclude_domains) > DISCOVER_EXCLUDE_DOMAINS_MAX:
+            raise ToolInputError(
+                "invalid_input",
+                "exclude_domains accepts at most "
+                f"{DISCOVER_EXCLUDE_DOMAINS_MAX} domains, got {len(exclude_domains)}",
+                "Drop the least important domains and retry.",
+            )
+
     data: dict[str, Any] = {
         "query": query,
         "notebook_id": notebook_id,
@@ -1871,8 +2075,66 @@ async def discover_sources(
     }
     if provider is not None:
         data["provider"] = provider
+    return data
+
+
+@mcp.tool()
+async def discover_sources(
+    query: str,
+    notebook_id: str,
+    limit: int = 5,
+    provider: Optional[str] = None,
+    embed: bool = False,
+    exclude_domains: Optional[list[str]] = None,
+    dry_run: bool = False,
+    fields: Optional[list[str]] = None,
+    detail: Detail = "summary",
+) -> dict[str, Any]:
+    """Search the web and attach the hits to a notebook as sources.
+
+    This is a search that creates sources, not a listing: the endpoint runs one
+    provider query and returns that single ranked batch. There is no cursor,
+    so the tool takes no offset. Ask again with a narrower query to see other
+    hits, or use dry_run to inspect the batch before anything is created.
+
+    Args:
+        query: What to search for (the topic to find sources about).
+        notebook_id: Notebook to attach the discovered sources to. Create one
+            first with create_notebook if the notebook does not exist yet.
+        limit: Maximum number of sources to create (1-20).
+        provider: Search backend name; omit to use the instance default.
+        embed: Embed the created sources so they are usable for vector search.
+        exclude_domains: Domains the provider must not return (max 50).
+        dry_run: Preview the ranked candidates without creating anything.
+        fields: Optional list of hit keys to keep, for example ['title', 'url'].
+            Wins over detail when both are given.
+        detail: Preset for how big a hit is: 'name' (title and url), 'summary'
+            (adds score, status and the created source id) or 'full' (the whole
+            hit, including the snippet and any error).
+
+    Returns:
+        The provider used, how many sources were created, how many were skipped
+        because the notebook already had them, and every hit with its outcome.
+    """
+    data = _build_discover_payload(
+        query,
+        notebook_id,
+        limit,
+        provider,
+        embed,
+        exclude_domains,
+        dry_run,
+    )
+    detail = _require_detail(detail, DETAIL_LEVELS)
+    fields = _require_fields(fields)
 
     result = await make_request("POST", "/api/sources/discover", json_data=data)
+    hits = result.get("results") if isinstance(result, dict) else None
+    if isinstance(hits, list):
+        result["results"] = [
+            _select_fields(hit, fields, detail, DISCOVER_DETAIL_FIELDS)
+            for hit in hits
+        ]
     return {
         "request_id": generate_request_id(),
         "result": result,
@@ -1892,48 +2154,35 @@ ARTIFACT_VARIANTS: dict[str, tuple[str, ...]] = {
 }
 
 
-@mcp.tool()
-async def generate_artifact(
+def _build_artifact_payload(
     notebook_id: str,
-    kind: str = "report",
-    variant: Optional[str] = None,
-    formats: Optional[list[str]] = None,
-    language: str = "en",
-    title: Optional[str] = None,
-    instructions: Optional[str] = None,
-    sections: int = 5,
-    model_id: Optional[str] = None,
+    kind: str,
+    variant: Optional[str],
+    formats: Optional[list[str]],
+    language: str,
+    title: Optional[str],
+    instructions: Optional[str],
+    sections: int,
+    model_id: Optional[str],
 ) -> dict[str, Any]:
-    """Generate a report or slide artifact from a notebook.
+    """Validate the artifact fields and build the API payload.
 
     Args:
         notebook_id: Notebook whose sources feed the artifact.
-        kind: 'report' or 'deck'. 'slides' is accepted as an alias for deck,
-            and any other value silently falls back to 'report' (it is
-            normalised server-side, not rejected). A deck is written as
-            bullets, a report as prose. Which FILES come out is a separate
-            question, see formats.
-        variant: Sub-variant of the kind. A report has 'document' (plain
-            prose, no diagrams) and 'illustrated' (prose plus ```mermaid```
-            diagrams rendered to images); a deck has 'presenter' (concise
-            bullets) and 'detailed' (full sentences under each bullet).
-            Defaults: 'document' for a report, 'presenter' for a deck. A
-            variant of the other kind is rejected with HTTP 400. Diagrams are
-            off for a plain report and on for everything else, so an
-            'illustrated' report is the way to get prose AND diagrams.
-        formats: Rendered formats ('md', 'html', 'docx', 'pptx'). This is
-            independent of kind: a deck is NOT automatically a pptx. Pass
-            'pptx' explicitly if you want the slide file.
+        kind: 'report', 'deck' or the 'slides' alias.
+        variant: Sub-variant of the kind.
+        formats: Rendered formats.
         language: Language name for the output.
-        title: Optional title override. Putting "with diagrams" in the title
-            does NOT enable diagrams - use variant='illustrated' or a deck.
+        title: Optional title override.
         instructions: Optional extra guidance for the writer.
         sections: How many sections to outline and write.
-        model_id: Optional model id override for the generation.
+        model_id: Optional model id override.
 
     Returns:
-        A command_id and an artifact_id. Generation runs in the background, so
-        poll get_artifact with the artifact_id until job_status settles.
+        The payload for POST /api/artifacts.
+
+    Raises:
+        ToolInputError: If a required field is missing or invalid.
     """
     notebook_id = _require_text(
         notebook_id,
@@ -1944,7 +2193,7 @@ async def generate_artifact(
         kind,
         "kind",
         "Use 'report' for prose or 'deck' for slides.",
-    )
+    ).lower()
     if kind not in ARTIFACT_KINDS:
         raise ToolInputError(
             "invalid_input",
@@ -2027,15 +2276,68 @@ async def generate_artifact(
         data["instructions"] = instructions
     if model_id is not None:
         data["model_id"] = model_id
+    return data
+
+
+@mcp.tool()
+async def generate_artifact(
+    notebook_id: str,
+    kind: str = "report",
+    variant: Optional[str] = None,
+    formats: Optional[list[str]] = None,
+    language: str = "en",
+    title: Optional[str] = None,
+    instructions: Optional[str] = None,
+    sections: int = 5,
+    model_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Generate a report or slide artifact from a notebook.
+
+    Args:
+        notebook_id: Notebook whose sources feed the artifact.
+        kind: 'report' or 'deck'. 'slides' is accepted as an alias for deck.
+            Any other value is rejected; the comparison ignores case, so
+            'Deck' works. A deck is written as bullets, a report as prose.
+            Which FILES come out is a separate question, see formats.
+        variant: Sub-variant of the kind. A report has 'document' (plain
+            prose, no diagrams) and 'illustrated' (prose plus ```mermaid```
+            diagrams rendered to images); a deck has 'presenter' (concise
+            bullets) and 'detailed' (full sentences under each bullet).
+            Defaults: 'document' for a report, 'presenter' for a deck. A
+            variant of the other kind is rejected with HTTP 400. Diagrams are
+            off for a plain report and on for everything else, so an
+            'illustrated' report is the way to get prose AND diagrams.
+        formats: Rendered formats ('md', 'html', 'docx', 'pptx'). This is
+            independent of kind: a deck is NOT automatically a pptx. Pass
+            'pptx' explicitly if you want the slide file.
+        language: Language name for the output.
+        title: Optional title override. Putting "with diagrams" in the title
+            does NOT enable diagrams - use variant='illustrated' or a deck.
+        instructions: Optional extra guidance for the writer.
+        sections: How many sections to outline and write.
+        model_id: Optional model id override for the generation.
+
+    Returns:
+        A command_id and an artifact_id. Generation runs in the background, so
+        poll get_artifact with the artifact_id until job_status settles.
+    """
+    data = _build_artifact_payload(
+        notebook_id,
+        kind,
+        variant,
+        formats,
+        language,
+        title,
+        instructions,
+        sections,
+        model_id,
+    )
 
     result = await make_request("POST", "/api/artifacts", json_data=data)
     return {
         "request_id": generate_request_id(),
         "result": result,
     }
-
-#: Detail levels accepted by list_artifacts.
-ARTIFACT_DETAIL_LEVELS: tuple[str, ...] = ("name", "summary", "full")
 
 #: Preset key sets for the detail levels of the artifact list, so a listing can
 #: stay cheap in the model's context. 'full' is absent: it keeps the whole row.
@@ -2051,26 +2353,6 @@ ARTIFACT_DETAIL_FIELDS: dict[str, tuple[str, ...]] = {
         "created",
     ),
 }
-
-def _select_artifact_fields(
-    artifact: Any, fields: Optional[list[str]], detail: str
-) -> Any:
-    """Keep only the asked-for keys of one artifact row.
-
-    Args:
-        artifact: One row as returned by the API.
-        fields: Explicit keys to keep; wins over detail when given.
-        detail: Preset name ('name', 'summary') or 'full' to keep everything.
-
-    Returns:
-        The projected row, or the row untouched when nothing was asked for.
-    """
-    if not isinstance(artifact, dict):
-        return artifact
-    keys = fields if fields else ARTIFACT_DETAIL_FIELDS.get(detail)
-    if not keys:
-        return artifact
-    return {key: artifact[key] for key in keys if key in artifact}
 
 @mcp.tool()
 async def list_artifacts(
@@ -2119,21 +2401,8 @@ async def list_artifacts(
             "notebook_id",
             "Pass a notebook ID, or leave it out to list every notebook.",
         )
-    if detail not in ARTIFACT_DETAIL_LEVELS:
-        raise ToolInputError(
-            "invalid_input",
-            f"detail must be one of {', '.join(ARTIFACT_DETAIL_LEVELS)}, got {detail!r}",
-            "Use 'summary' for the default row, 'name' for id and title only.",
-        )
-    if fields is not None:
-        fields = [
-            _require_text(
-                field,
-                "fields",
-                "Pass field names as strings, for example ['id', 'title'].",
-            )
-            for field in fields
-        ]
+    detail = _require_detail(detail, DETAIL_LEVELS)
+    fields = _require_fields(fields)
     params: dict[str, Any] = {}
     if notebook_id is not None:
         params["notebook_id"] = notebook_id
@@ -2142,7 +2411,7 @@ async def list_artifacts(
     rows: list[Any] = artifacts if isinstance(artifacts, list) else []
     total = len(rows)
     page = [
-        _select_artifact_fields(row, fields, detail)
+        _select_fields(row, fields, detail, ARTIFACT_DETAIL_FIELDS)
         for row in rows[offset : offset + limit]
     ]
     consumed = min(offset + len(page), total)

@@ -371,3 +371,88 @@ def test_api_failures_on_discovery_become_structured_errors(monkeypatch):
     assert excinfo.value.error_code == "api_error"
     assert "not found" in excinfo.value.message
     assert excinfo.value.request_id
+
+
+def test_discover_sources_rejects_too_many_excluded_domains(monkeypatch):
+    """The API caps the denylist at 50 entries, so we fail before the call."""
+    with (
+        _mock_api(monkeypatch),
+        pytest.raises(server.ToolInputError) as excinfo,
+    ):
+        asyncio.run(
+            server.discover_sources(
+                query="mcp",
+                notebook_id="notebook:1",
+                exclude_domains=[f"d{i}.example" for i in range(51)],
+            )
+        )
+
+    assert excinfo.value.error_code == "invalid_input"
+    assert "exclude_domains" in excinfo.value.message
+
+
+def test_discover_sources_lowercases_the_excluded_domains(monkeypatch):
+    """Hostnames are case-insensitive, so the denylist is normalized."""
+    with _mock_api(monkeypatch) as mock:
+        route = mock.post(f"{API_BASE}/api/sources/discover").mock(
+            return_value=Response(200, json={"created_count": 0, "results": []})
+        )
+        asyncio.run(
+            server.discover_sources(
+                query="mcp",
+                notebook_id="notebook:1",
+                exclude_domains=["Example.COM"],
+                dry_run=True,
+            )
+        )
+
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["exclude_domains"] == ["example.com"]
+
+
+def test_list_sources_rejects_a_limit_above_the_api_page(monkeypatch):
+    """The API answers 422 above 100, so the wrapper fails early instead."""
+    with (
+        _mock_api(monkeypatch),
+        pytest.raises(server.ToolInputError) as excinfo,
+    ):
+        asyncio.run(server.list_sources(limit=101))
+
+    assert excinfo.value.error_code == "invalid_input"
+    assert "limit" in excinfo.value.message
+
+
+def test_list_sources_rejects_a_negative_offset(monkeypatch):
+    """Paging starts at zero."""
+    with (
+        _mock_api(monkeypatch),
+        pytest.raises(server.ToolInputError) as excinfo,
+    ):
+        asyncio.run(server.list_sources(offset=-1))
+
+    assert excinfo.value.error_code == "invalid_input"
+    assert "offset" in excinfo.value.message
+
+
+def test_list_sources_rejects_an_unknown_detail(monkeypatch):
+    """Only the documented detail levels are accepted."""
+    with (
+        _mock_api(monkeypatch),
+        pytest.raises(server.ToolInputError) as excinfo,
+    ):
+        asyncio.run(server.list_sources(detail="everything"))
+
+    assert excinfo.value.error_code == "invalid_input"
+    assert "detail" in excinfo.value.message
+
+
+def test_list_sources_rejects_a_blank_field_name(monkeypatch):
+    """A blank projection key would silently drop out of the row."""
+    with (
+        _mock_api(monkeypatch),
+        pytest.raises(server.ToolInputError) as excinfo,
+    ):
+        asyncio.run(server.list_sources(fields=["id", "  "]))
+
+    assert excinfo.value.error_code == "invalid_input"
+    assert "fields" in excinfo.value.message

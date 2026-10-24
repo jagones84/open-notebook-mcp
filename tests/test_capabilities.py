@@ -589,6 +589,142 @@ def test_list_artifacts_publishes_its_paging_knobs():
         assert key in capability.args, key
 
 
+def test_list_sources_publishes_its_paging_knobs():
+    """The capability index has to describe the knobs the tool really has."""
+    capability = next(cap for cap in CAPABILITIES if cap.name == "list_sources")
+    for key in ("notebook_id", "limit", "offset", "fields", "detail"):
+        assert key in capability.args, key
+
+
+def test_discover_sources_publishes_its_projection_knobs():
+    """Discovery has no cursor upstream, but it does shrink rows on request."""
+    capability = next(cap for cap in CAPABILITIES if cap.name == "discover_sources")
+    for key in ("limit", "fields", "detail"):
+        assert key in capability.args, key
+
+
+def test_list_sources_forwards_the_page_to_the_api(monkeypatch):
+    """The API pages for real, so limit and offset travel as query params."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    rows = [{"id": "source:1", "title": "S1", "topics": [], "embedded": True}]
+
+    with _mock_api(monkeypatch) as mock:
+        route = mock.get(f"{API_BASE}/api/sources").mock(
+            return_value=Response(200, json=rows)
+        )
+        page = asyncio.run(server.list_sources(limit=10, offset=20))
+
+    params = route.calls[0].request.url.params
+    assert params["limit"] == "10"
+    assert params["offset"] == "20"
+    assert page["count"] == 1
+    assert page["offset"] == 20
+    assert page["next_offset"] is None
+
+
+def test_list_sources_keeps_the_cursor_open_on_a_full_page(monkeypatch):
+    """A full page may have more behind it, so the caller gets a next_offset."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    rows = [{"id": f"source:{i}"} for i in range(3)]
+
+    with _mock_api(monkeypatch) as mock:
+        mock.get(f"{API_BASE}/api/sources").mock(
+            return_value=Response(200, json=rows)
+        )
+        page = asyncio.run(server.list_sources(limit=3, offset=0))
+
+    assert page["next_offset"] == 3
+
+
+def test_list_sources_shrinks_rows_on_request(monkeypatch):
+    """detail and fields exist to keep the model's context small."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    row = {
+        "id": "source:1",
+        "title": "Paper",
+        "topics": ["mcp"],
+        "embedded": True,
+        "embedded_chunks": 12,
+        "insights_count": 2,
+        "status": "done",
+        "updated": "2026-01-01",
+    }
+
+    with _mock_api(monkeypatch) as mock:
+        mock.get(f"{API_BASE}/api/sources").mock(
+            return_value=Response(200, json=[row])
+        )
+        full = asyncio.run(server.list_sources(detail="full"))["sources"][0]
+        name = asyncio.run(server.list_sources(detail="name"))["sources"][0]
+        summary = asyncio.run(server.list_sources(detail="summary"))["sources"][0]
+        picked = asyncio.run(server.list_sources(fields=["title"]))["sources"][0]
+
+    assert full == row
+    assert name == {"id": "source:1", "title": "Paper"}
+    assert "id" in summary and "embedded_chunks" not in summary
+    assert picked == {"title": "Paper"}
+
+
+def test_discover_sources_projects_the_hits(monkeypatch):
+    """A hit carries a snippet; only detail='full' should pay for it."""
+    import asyncio
+
+    import open_notebook_mcp.server as server
+
+    hit = {
+        "title": "MCP spec",
+        "url": "https://example.com/mcp",
+        "snippet": "long provider excerpt",
+        "score": 0.9,
+        "source_id": None,
+        "status": "candidate",
+        "error": None,
+    }
+
+    def _payload():
+        return {
+            "query": "mcp",
+            "provider": "tavily",
+            "notebook_id": "notebook:1",
+            "created_count": 0,
+            "skipped_count": 0,
+            "results": [dict(hit)],
+        }
+
+    with _mock_api(monkeypatch) as mock:
+        mock.post(f"{API_BASE}/api/sources/discover").mock(
+            return_value=Response(200, json=_payload())
+        )
+        full = asyncio.run(
+            server.discover_sources(
+                query="mcp", notebook_id="notebook:1", dry_run=True, detail="full"
+            )
+        )["result"]["results"][0]
+        name = asyncio.run(
+            server.discover_sources(
+                query="mcp", notebook_id="notebook:1", dry_run=True, detail="name"
+            )
+        )["result"]["results"][0]
+        summary = asyncio.run(
+            server.discover_sources(
+                query="mcp", notebook_id="notebook:1", dry_run=True
+            )
+        )["result"]["results"][0]
+
+    assert full == hit
+    assert name == {"title": "MCP spec", "url": "https://example.com/mcp"}
+    assert "score" in summary and "snippet" not in summary
+
+
 if __name__ == "__main__":
     # Run tests
     test_capabilities_defined()
