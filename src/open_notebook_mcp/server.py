@@ -8,15 +8,16 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
+from importlib.metadata import version as _pkg_version
 from typing import Any, Literal, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("open-notebook-mcp")
 
-mcp = FastMCP("open-notebook-mcp")
+mcp = MCPServer("open-notebook-mcp", version=_pkg_version("open-notebook-mcp"))
 
 # -----------------------------
 # Configuration and Constants
@@ -2488,30 +2489,33 @@ def main() -> None:
     stateless_http = os.getenv("STATELESS_HTTP", "1") == "1"
     json_response = os.getenv("JSON_RESPONSE", "1") == "1"
 
-    # PATCHED-FOR-MCP1: mcp 1.x takes host/port/etc. via settings, not run()
-    mcp.settings.host = host
-    mcp.settings.port = port
-    mcp.settings.streamable_http_path = path
-    mcp.settings.json_response = json_response
-    mcp.settings.stateless_http = stateless_http
-
-    # PATCHED-FOR-MCP1: FastMCP() was built with the default loopback host, so
-    # DNS-rebinding protection was auto-enabled with loopback-only allowed
-    # hosts; widen it from env for non-loopback clients (else HTTP 421).
+    # DNS-rebinding protection: auto-enabled by mcp 2.x only when the bind
+    # address is loopback.  When the server listens on 0.0.0.0 (the default
+    # for remote access), the protection is off by default.  MCP_ALLOWED_HOSTS
+    # lets operators opt back in with an explicit allowlist.
+    transport_security = None
     extra_hosts = [
         h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
     ]
     if extra_hosts:
         from mcp.server.transport_security import TransportSecuritySettings
 
-        mcp.settings.transport_security = TransportSecuritySettings(
+        transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"] + extra_hosts,
             allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
             + [f"http://{h}" for h in extra_hosts],
         )
 
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=host,
+        port=port,
+        streamable_http_path=path,
+        stateless_http=stateless_http,
+        json_response=json_response,
+        transport_security=transport_security,
+    )
 
 if __name__ == "__main__":
     main()
